@@ -65,6 +65,18 @@ enum Role {
 }
 ```
 
+### RevokeReason (u32 discriminant)
+
+| Code | Name |
+|------|------|
+| 1 | `IdentityFraud` |
+| 2 | `CompromisedKey` |
+| 3 | `Regulatory` |
+| 4 | `DuplicateRegistration` |
+| 5 | `OperatorError` |
+| 6 | `GdprErasure` |
+| 99 | `Other` |
+
 ### ContractError (u32 discriminant)
 
 | Code | Name | Description |
@@ -612,7 +624,7 @@ stellar contract invoke --id $ID --source admin --network testnet --send=yes \
 
 ---
 
-### `revoke_verification(caller: Address, github_username: String) -> Result<(), ContractError>`
+### `revoke_verification(caller: Address, github_username: String, reason_code: u32) -> Result<(), ContractError>`
 
 Revoke verification for a registered contributor.
 
@@ -623,7 +635,7 @@ Admin authorization is authoritative. The `caller` argument must be the admin or
 | **Auth** | Admin **or** any address assigned `Role::Verifier` |
 | **Caller arg** | `caller: Address` — must be the admin or a `Verifier`-role holder |
 | **Mutates** | Yes |
-| **Errors** | `NotInitialized`, `NotRegistered`, `NotVerified`, `NotAuthorized` |
+| **Errors** | `NotInitialized`, `Paused`, `InvalidReasonCode`, `NotRegistered`, `NotVerified`, `NotAuthorized` |
 | **Events** | `VerificationRevokedEvent` |
 
 Like `verify`, the `caller` argument enables on-chain role enforcement. Only the contract admin or a `Verifier`-role holder may revoke verification. An `Upgrader`-role holder or an address with no role returns `NotAuthorized`.
@@ -636,8 +648,12 @@ Threat-model notes: [SECURITY.md](SECURITY.md#mainnet-verification-revoke-incide
 ```bash
 # Admin revoking verification (authoritative example)
 stellar contract invoke --id $ID --source admin --network testnet --send=yes \
-  -- revoke_verification --caller G... --github-username octocat
+  -- revoke_verification --caller G... --github-username octocat --reason-code 1
 ```
+
+`reason_code` is emitted in `VerificationRevokedEvent` and must be one of the
+codes documented in [`RevokeReason`](#revokereason-u32-discriminant): `1`–`6`
+or `99`.
 
 **Verify → revoke → verify cycle (Issue #95).** `verify` and
 `revoke_verification` can be applied to the same username repeatedly without
@@ -907,7 +923,7 @@ The following tests in `src/lib.rs` pin the full payload (Issue #64 / Wave #65):
 
 ```
 topics: ["verification_revoked_event", github_username]
-data:   { stellar_address, timestamp }
+data:   { stellar_address, timestamp, reason_code }
 ```
 
 Mirrors `VerifiedEvent`. Indexers subscribe to both and reconcile verified
@@ -916,7 +932,7 @@ compatibility surface.
 
 | Test | What it checks |
 |------|----------------|
-| `test_verification_revoked_event_payload_is_complete` | Full event list matches: topic symbol, `github_username` topic, `stellar_address` and `timestamp` in data |
+| `test_verification_revoked_event_payload_is_complete` | Full event list matches: topic symbol, `github_username` topic, `stellar_address`, `timestamp`, and `reason_code` in data |
 | `test_verification_revoked_event_not_published_on_not_verified` | **Failure path**: `NotVerified` must not publish an event |
 
 ### UpgradedEvent

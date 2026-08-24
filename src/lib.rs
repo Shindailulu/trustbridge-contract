@@ -4912,9 +4912,9 @@ mod test {
         });
     }
 
-    /// `VerificationRevokedEvent` includes the `reason_code` that was supplied.
+    /// The revocation event exposes the complete payload and stable topic shape.
     #[test]
-    fn test_revoke_verification_event_includes_reason_code() {
+    fn test_verification_revoked_event_payload_is_complete() {
         let env = Env::default();
         let (admin, user, _other, contract_id) = setup(&env);
         env.mock_all_auths();
@@ -4956,6 +4956,47 @@ mod test {
                     )
                 ],
                 "VerificationRevokedEvent must include the supplied reason_code"
+            );
+
+            let topics = expected.topics(&env);
+            assert_eq!(topics.len(), 2, "VerificationRevokedEvent must have 2 topics");
+            assert_eq!(
+                soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+                soroban_sdk::Symbol::new(&env, "verification_revoked_event"),
+                "VerificationRevokedEvent topic symbol changed"
+            );
+            assert_eq!(
+                String::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+                username(&env, "octocat"),
+                "VerificationRevokedEvent username topic changed"
+            );
+        });
+    }
+
+    /// A failed revoke must not publish an event that could make an indexer
+    /// mark an unverified contributor as revoked.
+    #[test]
+    fn test_verification_revoked_event_not_published_on_not_verified() {
+        let env = Env::default();
+        let (admin, user, _other, contract_id) = setup(&env);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::register(env.clone(), username(&env, "octocat"), user).unwrap();
+        });
+
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let result = TrustBridgeContract::revoke_verification(
+                env.clone(),
+                admin,
+                username(&env, "octocat"),
+                1,
+            );
+            assert_eq!(result, Err(ContractError::NotVerified));
+            assert_eq!(
+                env.events().all(),
+                soroban_sdk::vec![&env],
+                "failed revoke published a VerificationRevokedEvent"
             );
         });
     }
