@@ -24,7 +24,7 @@ pub use batch::{BatchConfig, BatchOperationResult, BatchSummary};
 pub use error::ContractError;
 pub use events::{
     PausedEvent, RegisteredEvent, RemovedEvent, RoleGrantedEvent, RoleRevokedEvent, UnpausedEvent,
-    UpgradedEvent, VerificationRevokedEvent, VerifiedEvent,
+    UpgradedEvent, UpgradeAttestedEvent, AttestationClearedEvent, VerificationRevokedEvent, VerifiedEvent,
 };
 pub use storage::{
     ContributorRecord, ExportPage, Role, Stats, VerificationConfig, WasmAttestation, WasmProvenance,
@@ -379,12 +379,19 @@ impl TrustBridgeContract {
         set_wasm_attestation(
             &env,
             &WasmAttestation {
-                wasm_hash,
+                wasm_hash: wasm_hash.clone(),
                 expires_at,
                 attested_by: admin,
                 attested_at: now,
             },
         );
+
+        UpgradeAttestedEvent {
+            wasm_hash,
+            expires_at,
+            timestamp: now,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -404,7 +411,17 @@ impl TrustBridgeContract {
         let admin = get_admin(&env)?;
         admin.require_auth();
 
-        remove_wasm_attestation(&env);
+        if let Some(attestation) = get_wasm_attestation(&env) {
+            remove_wasm_attestation(&env);
+            
+            AttestationClearedEvent {
+                wasm_hash: attestation.wasm_hash,
+                expires_at: attestation.expires_at,
+                timestamp: env.ledger().timestamp(),
+            }
+            .publish(&env);
+        }
+        
         Ok(())
     }
 

@@ -11,3 +11,7 @@ TrustBridge emits events so dashboards and indexers can build a readable contrib
 ## Useful event fields
 
 Indexers should capture the GitHub username, Stellar address, verification flag changes, ledger sequence, and transaction hash whenever available from the host environment.
+
+## Upgrades and Attestation
+
+Indexers tracking contract upgrades can rely on the `UpgradeAttestedEvent` and `AttestationClearedEvent` to monitor the two-step upgrade window. The actual execution of the upgrade emits the `UpgradedEvent`, which consumes the active attestation.
