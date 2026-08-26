@@ -107,3 +107,44 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  wasm-integration-test:
+    name: WASM Upgrade Integration Tests
+    runs-on: ubuntu-latest
+    needs: quality
+    if: always() && !cancelled()
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install wasm targets
+        run: rustup target add wasm32v1-none wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build WASM artifact
+        run: |
+          cargo build --target wasm32v1-none --release
+
+      - name: Run WASM upgrade integration tests
+        run: |
+          cargo test --features wasm-test --test integration -- \
+            test_integration_wasm_upgrade_cooldown --nocapture --exact
+
+      - name: Verify WASM test ran
+        run: |
+          cargo test --features wasm-test --test integration -- \
+            test_integration_wasm_upgrade_cooldown -- --list | grep "test_integration_wasm_upgrade_cooldown"
