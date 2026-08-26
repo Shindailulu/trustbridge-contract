@@ -27,7 +27,8 @@ pub use events::{
     UpgradedEvent, VerificationRevokedEvent, VerifiedEvent,
 };
 pub use storage::{
-    ContributorRecord, ExportPage, Role, Stats, VerificationConfig, WasmAttestation, WasmProvenance,
+    ContributorRecord, ExportPage, PauseReason, Role, Stats, VerificationConfig, WasmAttestation,
+    WasmProvenance,
 };
 pub use version::Version;
 
@@ -150,16 +151,24 @@ impl TrustBridgeContract {
     ///
     /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
     /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
-    pub fn pause(env: Env) -> Result<(), ContractError> {
+    /// - [`ContractError::InvalidPauseReason`] if `reason_code` is not a valid `PauseReason`.
+    pub fn pause(env: Env, reason_code: u32) -> Result<(), ContractError> {
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
 
+        if !PauseReason::is_valid(reason_code) {
+            return Err(ContractError::InvalidPauseReason);
+        }
+        let reason = PauseReason::from_code(reason_code).unwrap_or(PauseReason::Other);
+
         set_paused_state(&env, true);
+        crate::storage::set_pause_reason(&env, reason);
         let timestamp = env.ledger().timestamp();
         PausedEvent {
             admin: admin.clone(),
             timestamp,
+            reason_code,
         }
         .publish(&env);
 
@@ -185,16 +194,24 @@ impl TrustBridgeContract {
     ///
     /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
     /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
-    pub fn unpause(env: Env) -> Result<(), ContractError> {
+    /// - [`ContractError::InvalidPauseReason`] if `reason_code` is not a valid `PauseReason`.
+    pub fn unpause(env: Env, reason_code: u32) -> Result<(), ContractError> {
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
 
+        if !PauseReason::is_valid(reason_code) {
+            return Err(ContractError::InvalidPauseReason);
+        }
+        let reason = PauseReason::from_code(reason_code).unwrap_or(PauseReason::Other);
+
         set_paused_state(&env, false);
+        crate::storage::set_pause_reason(&env, reason);
         let timestamp = env.ledger().timestamp();
         UnpausedEvent {
             admin: admin.clone(),
             timestamp,
+            reason_code,
         }
         .publish(&env);
 
@@ -214,6 +231,13 @@ impl TrustBridgeContract {
     #[must_use]
     pub fn is_paused(env: Env) -> bool {
         storage_is_paused(&env)
+    }
+
+    /// Returns the reason code stored when the contract was last paused or
+    /// unpaused. Returns `PauseReason::Other` (99) if no reason has been stored.
+    #[must_use]
+    pub fn get_pause_reason(env: Env) -> PauseReason {
+        crate::storage::get_pause_reason(&env)
     }
 
     /// Assigns a role to `target`. Admin-only.
@@ -753,6 +777,12 @@ impl TrustBridgeContract {
             return Err(ContractError::ZeroAddress);
         }
 
+        // Reject reserved usernames before auth so the caller gets a clear
+        // error even without a valid signature, and before any write.
+        if crate::storage::is_reserved(&env, &github_username) {
+            return Err(ContractError::UsernameReserved);
+        }
+
         stellar_address.require_auth();
 
         let timestamp = env.ledger().timestamp();
@@ -1166,15 +1196,24 @@ impl TrustBridgeContract {
     /// `paused = true` before rotating the WASM hash so mutating calls fail
     /// fast, then set it back to `false` after the new binary is confirmed.
     ///
+    /// `reason_code` must be a valid `PauseReason` discriminant.
+    ///
     /// # Errors
     ///
     /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
-    pub fn set_paused(env: Env, paused: bool) -> Result<(), ContractError> {
+    /// - [`ContractError::InvalidPauseReason`] if `reason_code` is unrecognized.
+    pub fn set_paused(env: Env, paused: bool, reason_code: u32) -> Result<(), ContractError> {
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
 
+        if !PauseReason::is_valid(reason_code) {
+            return Err(ContractError::InvalidPauseReason);
+        }
+        let reason = PauseReason::from_code(reason_code).unwrap_or(PauseReason::Other);
+
         set_paused_state(&env, paused);
+        crate::storage::set_pause_reason(&env, reason);
         Ok(())
     }
 
@@ -1424,6 +1463,96 @@ impl TrustBridgeContract {
     #[must_use]
     pub fn is_registration_in_cooldown(env: Env, github_username: String) -> bool {
         is_in_cooldown(&env, &github_username)
+    }
+
+    // ── Reserved username list (Issue #213) ──────────────────────────────────
+
+    /// Adds `username` to the admin-managed reserved list. Admin-only.
+    ///
+    /// Once reserved, `register` calls for this username fail with
+    /// [`ContractError::UsernameReserved`] regardless of who signs them.
+    /// The check is case-insensitive, matching GitHub's own identity rules.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
+    /// - [`ContractError::InvalidUsername`] if the username is not a valid GitHub username shape.
+    /// - [`ContractError::AlreadyReserved`] if the username is already on the list.
+    /// - [`ContractError::ReservedListFull`] if the list has reached its maximum size.
+    pub fn add_reserved(env: Env, username: String) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        if !crate::utils::is_valid_github_username(&username) {
+            return Err(ContractError::InvalidUsername);
+        }
+
+        crate::storage::add_to_reserved(&env, &username)?;
+        Ok(())
+    }
+
+    /// Removes `username` from the reserved list. Admin-only.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
+    /// - [`ContractError::NotReserved`] if the username is not currently reserved.
+    pub fn remove_reserved(env: Env, username: String) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        crate::storage::remove_from_reserved(&env, &username)?;
+        Ok(())
+    }
+
+    /// Returns `true` if `username` is on the reserved list.
+    ///
+    /// Read-only; no auth required. Case-insensitive match.
+    #[must_use]
+    pub fn is_reserved(env: Env, username: String) -> bool {
+        crate::storage::is_reserved(&env, &username)
+    }
+
+    /// Returns the full reserved username list. Admin-only.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
+    pub fn get_reserved_list(env: Env) -> Result<Vec<String>, ContractError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        Ok(crate::storage::get_reserved_list(&env))
+    }
+
+    // ── Index compaction (Issue #209) ─────────────────────────────────────────
+
+    /// Rebuilds the chunked username index densely. Admin-only.
+    ///
+    /// After removals, chunks may have empty slots (holes). This operation
+    /// re-partitions the current flat index into contiguous full chunks plus
+    /// a single partial tail, removing all holes and reclaiming persistent
+    /// storage entries that are now empty. Pagination results remain the same
+    /// except that empty gaps are eliminated.
+    ///
+    /// Returns the number of chunks written after compaction.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
+    pub fn compact_index(env: Env) -> Result<u32, ContractError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        let chunks_written = crate::storage::compact_chunked_index(&env);
+        Ok(chunks_written)
     }
 }
 
@@ -1808,7 +1937,7 @@ mod test {
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
@@ -2747,7 +2876,7 @@ mod test {
         let contract_id = env.register(TrustBridgeContract, ());
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            let result = TrustBridgeContract::pause(env.clone());
+            let result = TrustBridgeContract::pause(env.clone(), 1);
             assert_eq!(result, Err(ContractError::NotInitialized));
         });
     }
@@ -2758,7 +2887,7 @@ mod test {
         let contract_id = env.register(TrustBridgeContract, ());
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            let result = TrustBridgeContract::unpause(env.clone());
+            let result = TrustBridgeContract::unpause(env.clone(), 4);
             assert_eq!(result, Err(ContractError::NotInitialized));
         });
     }
@@ -2850,14 +2979,18 @@ mod test {
             ContractError::InvalidBatchSize,
             ContractError::InvalidReasonCode,
             ContractError::ZeroAddress,
+            ContractError::InvalidPauseReason,
+            ContractError::AlreadyReserved,
+            ContractError::NotReserved,
+            ContractError::UsernameReserved,
+            ContractError::ReservedListFull,
         ] {
             assert_eq!(ContractError::from_code(variant.code()), Some(variant));
         }
         assert_eq!(ContractError::from_code(0), None);
-        // 17 is one past the highest assigned variant (ZeroAddress = 16):
-        // the first code guaranteed not to collide with a real variant as the
-        // enum grows, unlike a fixed gap in the middle of the table.
-        assert_eq!(ContractError::from_code(17), None);
+        // 22 is one past the highest assigned variant (ReservedListFull = 21):
+        // the first code guaranteed not to collide with a real variant.
+        assert_eq!(ContractError::from_code(22), None);
     }
 
     // --- Issue #69: max username length guard ---
@@ -3211,7 +3344,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
 
         env.as_contract(&contract_id, || {
@@ -3227,7 +3360,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::unpause(env.clone()).unwrap();
+            TrustBridgeContract::unpause(env.clone(), 4).unwrap();
         });
 
         env.as_contract(&contract_id, || {
@@ -3258,7 +3391,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
 
         env.mock_all_auths();
@@ -3274,7 +3407,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::unpause(env.clone()).unwrap();
+            TrustBridgeContract::unpause(env.clone(), 4).unwrap();
         });
 
         env.mock_all_auths();
@@ -3462,7 +3595,8 @@ mod test {
     #[test]
     fn test_from_code_unknown_returns_none() {
         assert_eq!(ContractError::from_code(0), None);
-        assert_eq!(ContractError::from_code(17), None);
+        // 22 is one past ReservedListFull = 21, the highest known code.
+        assert_eq!(ContractError::from_code(22), None);
         assert_eq!(ContractError::from_code(u32::MAX), None);
     }
 
@@ -4373,7 +4507,7 @@ mod test {
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
@@ -4607,7 +4741,7 @@ mod test {
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
@@ -4782,7 +4916,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
 
         env.mock_all_auths();
@@ -5254,7 +5388,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
             let usernames = soroban_sdk::vec![&env, username(&env, "user1")];
             assert_eq!(
                 TrustBridgeContract::batch_verify(env.clone(), admin.clone(), usernames),

@@ -59,6 +59,8 @@ pub struct PausedEvent {
     #[topic]
     pub admin: Address,
     pub timestamp: u64,
+    /// Numeric reason code from `PauseReason` explaining why the contract was paused.
+    pub reason_code: u32,
 }
 
 /// Emitted when the contract is unpaused via `unpause`.
@@ -68,6 +70,8 @@ pub struct UnpausedEvent {
     #[topic]
     pub admin: Address,
     pub timestamp: u64,
+    /// Numeric reason code from `PauseReason` explaining why the contract was unpaused.
+    pub reason_code: u32,
 }
 
 /// Emitted when a role is granted to an address via `set_role`.

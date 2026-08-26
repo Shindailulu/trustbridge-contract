@@ -101,6 +101,11 @@ pub fn classify_error(error: ContractError) -> ErrorCategory {
         ContractError::InvalidBatchSize => ErrorCategory::Validation,
         ContractError::InvalidReasonCode => ErrorCategory::Validation,
         ContractError::ZeroAddress => ErrorCategory::Validation,
+        ContractError::InvalidPauseReason => ErrorCategory::Validation,
+        ContractError::AlreadyReserved => ErrorCategory::Validation,
+        ContractError::NotReserved => ErrorCategory::Validation,
+        ContractError::UsernameReserved => ErrorCategory::Validation,
+        ContractError::ReservedListFull => ErrorCategory::Permanent,
     }
 }
 
