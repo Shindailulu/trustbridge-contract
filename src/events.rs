@@ -92,6 +92,26 @@ pub struct RoleRevokedEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when a WASM upgrade is attested via `attest_upgrade`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeAttestedEvent {
+    #[topic]
+    pub wasm_hash: BytesN<32>,
+    pub expires_at: u64,
+    pub timestamp: u64,
+}
+
+/// Emitted when a WASM upgrade attestation is cleared via `clear_attestation`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestationClearedEvent {
+    #[topic]
+    pub wasm_hash: BytesN<32>,
+    pub expires_at: u64,
+    pub timestamp: u64,
+}
+
 #[cfg(test)]
 mod test {
     use crate::{TrustBridgeContract, TrustBridgeContractClient};

@@ -780,6 +780,7 @@ Declare in advance the WASM hash you intend to deploy. Admin-only.
 | **Auth** | Admin |
 | **Mutates** | Yes |
 | **Errors** | `NotInitialized`, `AttestationExpired` (if `expires_at` is not in the future) |
+| **Events** | `UpgradeAttestedEvent` |
 
 **Optional two-step upgrade.** While an attestation is live, `upgrade` accepts
 only the hash it names — so a compromised admin key cannot swap in a different
@@ -811,6 +812,13 @@ stellar contract invoke --id $ID --source admin --network testnet --send=yes \
 Withdraw a pending attestation. Admin-only. The escape hatch for one published
 in error — without it the admin would have to wait out the expiry before
 upgrading to any other hash.
+
+| | |
+|---|---|
+| **Auth** | Admin |
+| **Mutates** | Yes |
+| **Errors** | `NotInitialized` |
+| **Events** | `AttestationClearedEvent` (only if an attestation was actively stored) |
 
 ---
 
