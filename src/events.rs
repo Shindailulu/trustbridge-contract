@@ -96,33 +96,21 @@ pub struct RoleRevokedEvent {
     pub timestamp: u64,
 }
 
-/// Emitted when an admin proposes transferring admin rights to a new address (Issue #195).
+/// Emitted when the guardian or admin trips the emergency pause (Issue #196).
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminTransferProposedEvent {
+pub struct EmergencyPausedEvent {
     #[topic]
-    pub new_admin: Address,
-    pub proposed_by: Address,
-    pub executable_at: u64,
+    pub triggered_by: Address,
     pub timestamp: u64,
 }
 
-/// Emitted when an admin transfer proposal is cancelled (Issue #195).
+/// Emitted when the admin clears the emergency pause (Issue #196).
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminTransferCancelledEvent {
+pub struct EmergencyClearedEvent {
     #[topic]
-    pub cancelled_by: Address,
-    pub timestamp: u64,
-}
-
-/// Emitted when admin rights are transferred to the new admin (Issue #195).
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminTransferExecutedEvent {
-    #[topic]
-    pub new_admin: Address,
-    pub old_admin: Address,
+    pub admin: Address,
     pub timestamp: u64,
 }
 
