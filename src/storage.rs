@@ -50,6 +50,12 @@ pub const AUDIT_STATS_KEY: Symbol = symbol_short!("adt_stat");
 /// Aliased as VERSION_KEY for callers that use that name.
 pub const VERSION_KEY: Symbol = VER_KEY;
 
+/// Key for a pending admin transfer proposal (Issue #195).
+pub const ADMIN_TRANSFER_KEY: Symbol = symbol_short!("adm_xfr");
+
+/// Key for whether WASM attestation is required before upgrade (Issue #198).
+pub const ATTEST_REQUIRED_KEY: Symbol = symbol_short!("att_req");
+
 // ── Pagination constants ─────────────────────────────────────────────────────
 
 pub const DEFAULT_PAGE_LIMIT: u32 = 20;
@@ -171,6 +177,29 @@ pub struct WasmAttestation {
     pub attested_by: Address,
     /// Ledger timestamp the attestation was published.
     pub attested_at: u64,
+}
+
+/// A pending admin-transfer proposal (Issue #195).
+///
+/// Created by `propose_admin_transfer` and consumed by `execute_admin_transfer`
+/// after the mandatory delay elapses. `cancel_admin_transfer` removes the
+/// pending record at any time before execution.
+///
+/// Only one proposal may be live at a time. A second call to
+/// `propose_admin_transfer` while one is pending overwrites it, which is
+/// intentional: the admin may correct a mistaken address during the delay
+/// window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[soroban_sdk::contracttype]
+pub struct AdminTransferProposal {
+    /// The candidate that will become admin after the delay.
+    pub new_admin: Address,
+    /// The current admin that proposed the transfer.
+    pub proposed_by: Address,
+    /// Ledger timestamp when `propose_admin_transfer` was called.
+    pub proposed_at: u64,
+    /// Earliest ledger timestamp at which `execute_admin_transfer` may run.
+    pub executable_at: u64,
 }
 
 /// Aggregate registry statistics returned by `get_stats`.
@@ -554,7 +583,11 @@ pub fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&PAUSED_KEY, &paused);
 }
 
-#[allow(dead_code)]
+/// Returns whether `github_username` has a pending re-verification flag set.
+///
+/// This flag is set when a verified user re-registers to a different Stellar
+/// address, indicating a new off-chain GitHub identity check is needed.
+/// It is cleared when the record is successfully `verify`'d.
 pub fn get_pending_reverify(env: &Env, github_username: &String) -> bool {
     let key = (PENDING_REVERIFY_KEY, github_username.clone());
     env.storage().persistent().get(&key).unwrap_or(false)
@@ -616,6 +649,41 @@ pub fn set_wasm_attestation(env: &Env, attestation: &WasmAttestation) {
 
 pub fn remove_wasm_attestation(env: &Env) {
     env.storage().instance().remove(&ATTEST_KEY);
+}
+
+// ── Admin transfer (Issue #195) ───────────────────────────────────────────────
+
+/// Returns the pending admin transfer proposal, if one exists.
+pub fn get_admin_transfer(env: &Env) -> Option<AdminTransferProposal> {
+    env.storage().instance().get(&ADMIN_TRANSFER_KEY)
+}
+
+/// Stores a new admin transfer proposal, overwriting any existing one.
+pub fn set_admin_transfer(env: &Env, proposal: &AdminTransferProposal) {
+    env.storage().instance().set(&ADMIN_TRANSFER_KEY, proposal);
+}
+
+/// Removes the pending admin transfer proposal.
+pub fn clear_admin_transfer(env: &Env) {
+    env.storage().instance().remove(&ADMIN_TRANSFER_KEY);
+}
+
+// ── Attestation-required config (Issue #198) ──────────────────────────────────
+
+/// Returns whether WASM attestation is required before an upgrade.
+/// Defaults to `false` (opt-in two-step mode) to preserve backward compatibility.
+pub fn is_attestation_required(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&ATTEST_REQUIRED_KEY)
+        .unwrap_or(false)
+}
+
+/// Sets the attestation-required flag.
+pub fn set_attestation_required(env: &Env, required: bool) {
+    env.storage()
+        .instance()
+        .set(&ATTEST_REQUIRED_KEY, &required);
 }
 
 // ── Per-user action cooldown (Wave #33) ──────────────────────────────────────

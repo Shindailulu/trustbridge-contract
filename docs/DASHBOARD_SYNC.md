@@ -154,3 +154,52 @@ no state change, no duplicate row, and no double count in any aggregate.
 
 See [ABI.md — Events](ABI.md#events) for the full topic/payload reference per
 event type.
+
+---
+
+## Pending Re-verification (Issue #208)
+
+When a contributor who was previously **verified** re-registers to a **different
+Stellar address**, the contract:
+
+1. Clears their `verified` flag and decrements the verified count.
+2. Sets a `pending_reverify` flag for that username in persistent storage.
+
+This flag signals that a new off-chain GitHub identity check is required — the
+new Stellar address has not yet been linked to the GitHub account.
+
+### Reading pending-reverify state
+
+Two public read endpoints expose this flag (no auth required, work while paused):
+
+| Endpoint | Use |
+|---|---|
+| `get_pending_reverify(github_username)` | Check a single username — returns `bool` |
+| `get_pending_reverify_page(offset, limit)` | Paginated scan — returns `Vec<String>` of usernames with the flag set |
+
+`get_pending_reverify` returns `false` for:
+- Usernames that have never been registered.
+- Usernames that have been removed.
+- Usernames whose flag was cleared (because they were successfully re-verified).
+
+### Dashboard sync workflow
+
+1. **On `RegisteredEvent`** where the old and new `stellar_address` differ, call
+   `get_pending_reverify(username)` to confirm the flag was set. Queue the
+   contributor for a re-verification workflow.
+2. **On `VerifiedEvent`**, the flag is cleared automatically — no additional call needed.
+3. **Periodic reconciliation**: Call `get_pending_reverify_page(0, 100)` to build
+   the full list of contributors awaiting re-check. This is cheaper than scanning
+   all registrations individually and is authoritative.
+
+### Relationship to verification flow
+
+```
+register(new_address)          →  pending_reverify = true
+verify(username)               →  pending_reverify cleared (flag removed)
+remove(username)               →  record deleted (flag irrelevant)
+```
+
+The flag is **write-once per address-change cycle** — re-calling `register`
+with the same new address (e.g. to extend TTL) does not re-set the flag if
+it was already cleared by `verify`.

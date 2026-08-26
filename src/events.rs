@@ -92,6 +92,36 @@ pub struct RoleRevokedEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when an admin proposes transferring admin rights to a new address (Issue #195).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferProposedEvent {
+    #[topic]
+    pub new_admin: Address,
+    pub proposed_by: Address,
+    pub executable_at: u64,
+    pub timestamp: u64,
+}
+
+/// Emitted when an admin transfer proposal is cancelled (Issue #195).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelledEvent {
+    #[topic]
+    pub cancelled_by: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when admin rights are transferred to the new admin (Issue #195).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferExecutedEvent {
+    #[topic]
+    pub new_admin: Address,
+    pub old_admin: Address,
+    pub timestamp: u64,
+}
+
 #[cfg(test)]
 mod test {
     use crate::{TrustBridgeContract, TrustBridgeContractClient};
