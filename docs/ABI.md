@@ -381,6 +381,36 @@ registry proceeds exactly as it would on a never-used one. Covered by
 
 ---
 
+### `batch_remove(caller: Address, usernames: Vec<String>) -> Result<BatchSummary, ContractError>`
+
+Removes multiple registrations in a single invocation, collecting per-entry errors rather than aborting on the first failure.
+
+This is the batched form of `remove`, intended for admin workflows that need to clean up many stale or disputed registrations efficiently. Doing that as N separate invocations costs N transactions, N signatures, and N rounds of ledger overhead — this is one.
+
+| | |
+|---|---|
+| **Auth** | Admin |
+| **Mutates** | Yes |
+| **Errors** | `NotInitialized`, `Paused`, `InvalidBatchSize`, `NotAuthorized` |
+| **Events** | One `RemovedEvent` per successfully removed contributor |
+
+**Partial success is the point.** A username that cannot be removed (e.g., not registered) does not abort the batch; it is counted as a failure in the returned `BatchSummary` and the rest proceed. A cleanup of 100 contributors must not be lost wholesale because one entry was already removed.
+
+Unlike the single `remove` function which allows registrants to self-remove, `batch_remove` is strictly admin-only.
+
+| Outcome | Counted as | Notes |
+|---------|------------|-------|
+| Registered, caller is admin | `successful` | Record removed, `RemovedEvent` published |
+| Not registered | `failed` | Skipped, batch continues |
+| Caller not authorized | `failed` | The entire call fails with `NotAuthorized` if the caller is not the admin |
+
+```bash
+stellar contract invoke --id $ID --source admin --network testnet --send=yes \
+  -- batch_remove --caller G... --usernames '["octocat","alice"]'
+```
+
+---
+
 ### `get_all_registered() -> Result<Vec<(String, Address)>, ContractError>`
 
 Export the full registry. Admin-only.

@@ -437,6 +437,21 @@ Operational teams should:
 
 ---
 
+## Batch Remove Semantics
+
+The `batch_remove` function provides an efficient way to clean up multiple registrations in one transaction. It introduces specific security considerations:
+
+### 1. Admin-Only Auth
+Unlike single `remove`, which allows a registrant to self-remove, `batch_remove` is strictly admin-only. A registrant attempting to remove their own record via `batch_remove` will receive `NotAuthorized`. The `batch_remove` surface is for administrative cleanup, not self-service.
+
+### 2. Partial Failure by Design
+A batch call does not revert if a single username fails to be removed (e.g., if it was already removed or was never registered). Instead, the failure is tallied in the returned `BatchSummary`, and the transaction continues. This ensures that one disputed or stale record does not grief an entire cleanup batch. The transaction only aborts if the caller lacks authorization, the contract is paused, or the batch size limit is exceeded.
+
+### 3. Griefing Size Cap
+To prevent a malicious or erroneous caller from exhausting the network CPU/memory budget in a single transaction (and causing an out-of-gas panic that masks partial success), `batch_remove` enforces a strict maximum batch size (configured via `BatchConfig`). Submitting a list of usernames larger than this cap immediately reverts the transaction with `InvalidBatchSize`.
+
+---
+
 ## Verify and Revoke_Verification Auth Negative Matrix
 
 Dashboard operators and auditors need the full failure surface of `verify` and `revoke_verification` spelled out.
