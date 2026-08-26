@@ -23,25 +23,29 @@ pub use audit::{AuditConfig, AuditEventType, AuditLogEntry, AuditStats};
 pub use batch::{BatchConfig, BatchOperationResult, BatchSummary};
 pub use error::ContractError;
 pub use events::{
+    AdminTransferCancelledEvent, AdminTransferExecutedEvent, AdminTransferProposedEvent,
     PausedEvent, RegisteredEvent, RemovedEvent, RoleGrantedEvent, RoleRevokedEvent, UnpausedEvent,
     UpgradedEvent, UpgradeAttestedEvent, AttestationClearedEvent, VerificationRevokedEvent, VerifiedEvent,
 };
 pub use storage::{
-    ContributorRecord, ExportPage, Role, Stats, VerificationConfig, WasmAttestation, WasmProvenance,
+    AdminTransferProposal, ContributorRecord, ExportPage, Role, Stats, VerificationConfig,
+    WasmAttestation, WasmProvenance,
 };
 pub use version::Version;
 
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Symbol, Vec};
 
 use crate::storage::{
-    add_to_index, clear_pending_reverify, get_admin, get_audit_logs, get_audit_stats,
-    get_cooldown as storage_get_cooldown, get_count, get_index, get_last_upgrade, get_record,
+    add_to_index, clear_admin_transfer, clear_pending_reverify, get_admin, get_admin_transfer,
+    get_audit_logs, get_audit_stats, get_cooldown as storage_get_cooldown, get_count, get_index,
+    get_last_upgrade, get_pending_reverify as storage_get_pending_reverify, get_record,
     get_registered_paginated_internal, get_role as storage_get_role, get_stats as read_stats,
     get_verification_config, get_verified_count as storage_get_verified_count,
     get_version as storage_get_version, get_wasm_attestation, get_wasm_provenance, has_record,
-    is_admin_caller, is_in_cooldown, is_paused as storage_is_paused, push_audit_entry,
-    remove_from_index, remove_record, remove_role as storage_remove_role, remove_wasm_attestation,
-    require_initialized, require_not_paused, set_cooldown as storage_set_cooldown, set_count,
+    is_admin_caller, is_attestation_required, is_in_cooldown, is_paused as storage_is_paused,
+    push_audit_entry, remove_from_index, remove_record, remove_role as storage_remove_role,
+    remove_wasm_attestation, require_initialized, require_not_paused,
+    set_admin_transfer, set_attestation_required, set_cooldown as storage_set_cooldown, set_count,
     set_last_action, set_last_upgrade, set_paused as set_paused_state, set_pending_reverify,
     set_record, set_role as storage_set_role, set_verified_count, set_version,
     set_wasm_attestation, set_wasm_provenance, ADMIN_KEY,
@@ -533,6 +537,11 @@ impl TrustBridgeContract {
     /// Returns whether the upgrade was covered by an attestation, which is
     /// recorded in the provenance so an auditor can tell a two-step upgrade
     /// from a direct one after the fact.
+    ///
+    /// When `attestation_required` is `true` (set via `set_attestation_required`),
+    /// a missing attestation fails with [`ContractError::AttestationRequired`]
+    /// instead of silently proceeding. Hash mismatches and expired attestations
+    /// always fail regardless of the required flag.
     fn consume_attestation(
         env: &Env,
         new_wasm_hash: &BytesN<32>,
@@ -540,10 +549,16 @@ impl TrustBridgeContract {
     ) -> Result<bool, ContractError> {
         let attestation = match get_wasm_attestation(env) {
             Some(a) => a,
-            // Attestation is opt-in: with none published, upgrade behaves as it
-            // always has. Making it mandatory would brick every deployment that
-            // upgrades without adopting the new flow.
-            None => return Ok(false),
+            None => {
+                // When attestation is mandatory, a missing attestation is an error.
+                if is_attestation_required(env) {
+                    return Err(ContractError::AttestationRequired);
+                }
+                // Attestation is opt-in: with none published, upgrade behaves as it
+                // always has. Making it mandatory would brick every deployment that
+                // upgrades without adopting the new flow.
+                return Ok(false);
+            }
         };
 
         if now > attestation.expires_at {
@@ -1441,6 +1456,255 @@ impl TrustBridgeContract {
     #[must_use]
     pub fn is_registration_in_cooldown(env: Env, github_username: String) -> bool {
         is_in_cooldown(&env, &github_username)
+    }
+
+    // ── Issue #195: Two-step admin rotation with delay ────────────────────────
+
+    /// Proposes a transfer of admin rights to `new_admin`. Admin-only.
+    ///
+    /// The transfer is not immediate. It becomes executable only after
+    /// `delay_seconds` have elapsed, giving watchers time to detect and
+    /// react to an unexpected proposal. During the delay the current admin
+    /// remains the sole admin — there is no window with two live admins.
+    ///
+    /// Calling this while a proposal is already pending **overwrites** the
+    /// pending record, allowing the current admin to correct a mistaken address
+    /// or delay without having to cancel first.
+    ///
+    /// Emits [`AdminTransferProposedEvent`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::Paused`] if the contract is paused.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
+    /// - [`ContractError::ZeroAddress`] if `new_admin` is the zero/burn address.
+    pub fn propose_admin_transfer(
+        env: Env,
+        new_admin: Address,
+        delay_seconds: u64,
+    ) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        if is_zero_address(&env, &new_admin) {
+            return Err(ContractError::ZeroAddress);
+        }
+
+        let now = env.ledger().timestamp();
+        let executable_at = now.saturating_add(delay_seconds);
+
+        let proposal = AdminTransferProposal {
+            new_admin: new_admin.clone(),
+            proposed_by: admin.clone(),
+            proposed_at: now,
+            executable_at,
+        };
+        set_admin_transfer(&env, &proposal);
+
+        AdminTransferProposedEvent {
+            new_admin,
+            proposed_by: admin,
+            executable_at,
+            timestamp: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Cancels a pending admin transfer proposal. Admin-only.
+    ///
+    /// May be called at any time before `execute_admin_transfer`, including
+    /// during the delay window. No-op if no proposal is pending.
+    ///
+    /// Emits [`AdminTransferCancelledEvent`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        clear_admin_transfer(&env);
+
+        let now = env.ledger().timestamp();
+        AdminTransferCancelledEvent {
+            cancelled_by: admin,
+            timestamp: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Executes a pending admin transfer proposal after the delay has elapsed.
+    ///
+    /// Must be called by the proposed new admin, who proves acceptance by
+    /// signing the transaction. The current admin's rights are revoked at this
+    /// point — there is never a window with two live admins.
+    ///
+    /// After execution:
+    /// - `ADMIN_KEY` points at `new_admin`.
+    /// - The old admin's `Role::Admin` role entry is removed.
+    /// - The new admin is granted `Role::Admin`.
+    ///
+    /// Emits [`AdminTransferExecutedEvent`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::Paused`] if the contract is paused.
+    /// - [`ContractError::NoPendingAdminTransfer`] if no proposal exists.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the proposed new admin.
+    /// - [`ContractError::AdminTransferDelayActive`] if the delay has not yet elapsed.
+    pub fn execute_admin_transfer(env: Env, caller: Address) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+
+        caller.require_auth();
+
+        let proposal =
+            get_admin_transfer(&env).ok_or(ContractError::NoPendingAdminTransfer)?;
+
+        if caller != proposal.new_admin {
+            return Err(ContractError::NotAuthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < proposal.executable_at {
+            return Err(ContractError::AdminTransferDelayActive);
+        }
+
+        let old_admin = proposal.proposed_by.clone();
+
+        // Remove the pending proposal first so state is always consistent.
+        clear_admin_transfer(&env);
+
+        // Atomically rotate: write the new admin key, update roles.
+        env.storage().instance().set(&ADMIN_KEY, &proposal.new_admin);
+        storage_remove_role(&env, &old_admin);
+        storage_set_role(&env, &proposal.new_admin, &Role::Admin);
+
+        AdminTransferExecutedEvent {
+            new_admin: proposal.new_admin.clone(),
+            old_admin,
+            timestamp: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the pending admin transfer proposal, if any.
+    ///
+    /// Read-only; no auth required. Returns `None` if no transfer is pending.
+    #[must_use]
+    pub fn get_admin_transfer(env: Env) -> Option<AdminTransferProposal> {
+        get_admin_transfer(&env)
+    }
+
+    // ── Issue #208: Public pending-reverify read ──────────────────────────────
+
+    /// Returns whether `github_username` has a pending re-verification flag.
+    ///
+    /// This flag is set when a verified user re-registers to a different Stellar
+    /// address (the address change invalidates the prior verification, so a new
+    /// off-chain GitHub identity check is required). The flag is cleared once
+    /// the record is successfully `verify`'d.
+    ///
+    /// Read-only; works while the contract is paused. Returns `false` for
+    /// usernames that have never been registered or have been removed.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    pub fn get_pending_reverify(
+        env: Env,
+        github_username: String,
+    ) -> Result<bool, ContractError> {
+        require_initialized(&env)?;
+        // Deliberately allowed while paused — read-only path.
+        Ok(storage_get_pending_reverify(&env, &github_username))
+    }
+
+    /// Returns a page of usernames that have a pending re-verification flag.
+    ///
+    /// Iterates over the global username index from `offset`, collecting at
+    /// most `limit` usernames whose pending-reverify flag is set. Useful for
+    /// dashboard sync jobs that need to identify all contributors requiring a
+    /// new GitHub identity check after an address change.
+    ///
+    /// Read-only; works while the contract is paused.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    pub fn get_pending_reverify_page(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<String>, ContractError> {
+        require_initialized(&env)?;
+        // Read-only — allowed while paused.
+
+        let capped_limit = limit.min(crate::storage::MAX_PAGE_LIMIT);
+        let index = crate::storage::get_index_page(&env, offset, capped_limit * 10); // over-fetch to find `limit` flagged
+        let mut result = Vec::new(&env);
+
+        for i in 0..index.len() {
+            if result.len() >= capped_limit {
+                break;
+            }
+            if let Some(username) = index.get(i) {
+                if storage_get_pending_reverify(&env, &username) {
+                    result.push_back(username);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    // ── Issue #198: Attestation-required mode ─────────────────────────────────
+
+    /// Configures whether WASM attestation is required before an upgrade. Admin-only.
+    ///
+    /// When `required` is `true`, `upgrade` will fail with
+    /// [`ContractError::AttestationRequired`] if no valid, matching attestation
+    /// is present. This enforces the two-step upgrade flow on-chain for
+    /// deployments that require it.
+    ///
+    /// When `required` is `false` (the default), the existing opt-in behavior
+    /// is preserved: an upgrade without a published attestation succeeds, and
+    /// the provenance record notes that it was unattested.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
+    pub fn set_attestation_required(env: Env, required: bool) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        set_attestation_required(&env, required);
+        Ok(())
+    }
+
+    /// Returns whether WASM attestation is required before an upgrade.
+    ///
+    /// Read-only; no auth required. Defaults to `false` on instances that have
+    /// never called `set_attestation_required`.
+    #[must_use]
+    pub fn is_attestation_required(env: Env) -> bool {
+        is_attestation_required(&env)
     }
 }
 
@@ -2867,14 +3131,16 @@ mod test {
             ContractError::InvalidBatchSize,
             ContractError::InvalidReasonCode,
             ContractError::ZeroAddress,
+            ContractError::AdminTransferPending,
+            ContractError::AdminTransferDelayActive,
+            ContractError::NoPendingAdminTransfer,
+            ContractError::AttestationRequired,
         ] {
             assert_eq!(ContractError::from_code(variant.code()), Some(variant));
         }
         assert_eq!(ContractError::from_code(0), None);
-        // 17 is one past the highest assigned variant (ZeroAddress = 16):
-        // the first code guaranteed not to collide with a real variant as the
-        // enum grows, unlike a fixed gap in the middle of the table.
-        assert_eq!(ContractError::from_code(17), None);
+        // 21 is one past the highest assigned variant (AttestationRequired = 20):
+        assert_eq!(ContractError::from_code(21), None);
     }
 
     // --- Issue #69: max username length guard ---
@@ -3469,6 +3735,10 @@ mod test {
             ContractError::InvalidBatchSize,
             ContractError::InvalidReasonCode,
             ContractError::ZeroAddress,
+            ContractError::AdminTransferPending,
+            ContractError::AdminTransferDelayActive,
+            ContractError::NoPendingAdminTransfer,
+            ContractError::AttestationRequired,
         ];
         for variant in all {
             assert_eq!(ContractError::from_code(variant as u32), Some(variant));
@@ -3479,7 +3749,7 @@ mod test {
     #[test]
     fn test_from_code_unknown_returns_none() {
         assert_eq!(ContractError::from_code(0), None);
-        assert_eq!(ContractError::from_code(17), None);
+        assert_eq!(ContractError::from_code(21), None);
         assert_eq!(ContractError::from_code(u32::MAX), None);
     }
 

@@ -92,23 +92,33 @@ pub struct RoleRevokedEvent {
     pub timestamp: u64,
 }
 
-/// Emitted when a WASM upgrade is attested via `attest_upgrade`.
+/// Emitted when an admin proposes transferring admin rights to a new address (Issue #195).
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UpgradeAttestedEvent {
+pub struct AdminTransferProposedEvent {
     #[topic]
-    pub wasm_hash: BytesN<32>,
-    pub expires_at: u64,
+    pub new_admin: Address,
+    pub proposed_by: Address,
+    pub executable_at: u64,
     pub timestamp: u64,
 }
 
-/// Emitted when a WASM upgrade attestation is cleared via `clear_attestation`.
+/// Emitted when an admin transfer proposal is cancelled (Issue #195).
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AttestationClearedEvent {
+pub struct AdminTransferCancelledEvent {
     #[topic]
-    pub wasm_hash: BytesN<32>,
-    pub expires_at: u64,
+    pub cancelled_by: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when admin rights are transferred to the new admin (Issue #195).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferExecutedEvent {
+    #[topic]
+    pub new_admin: Address,
+    pub old_admin: Address,
     pub timestamp: u64,
 }
 

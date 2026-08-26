@@ -95,7 +95,12 @@ enum Role {
 | 12 | `AttestationExpired` | Upgrade attestation's `expires_at` has passed |
 | 13 | `UnattestedWasm` | `upgrade` hash does not match the live attestation |
 | 14 | `InvalidBatchSize` | Batch call supplied zero items or more than the configured max |
-| 15 | `ZeroAddress` | Supplied Stellar address is the well-known zero/burn address |
+| 15 | `InvalidReasonCode` | `revoke_verification` was called with an unrecognized reason code |
+| 16 | `ZeroAddress` | Supplied Stellar address is the well-known zero/burn address |
+| 17 | `AdminTransferPending` | A second propose while one was already pending (reserved) |
+| 18 | `AdminTransferDelayActive` | `execute_admin_transfer` called before the delay elapsed |
+| 19 | `NoPendingAdminTransfer` | `execute_admin_transfer` called with no pending proposal |
+| 20 | `AttestationRequired` | `upgrade` called without attestation when required mode is on |
 
 `ContractError::from_code(u32)` maps every code in this table back to the typed
 variant and returns `None` for any unrecognized code. Every code round-trips
@@ -116,12 +121,10 @@ One-time setup. Stores the admin address and zeroes counters.
 | **Mutates** | Yes |
 | **Errors** | `AlreadyInitialized` |
 
-**Admin immutability (Issue #97).** The admin address set here cannot be
-overwritten or silently replaced afterward: `initialize` is the only entry
-point that writes it, and a second call always fails with
-`AlreadyInitialized`, regardless of which admin address it names. No other
-function in this ABI mutates the admin. There is no on-chain admin-transfer
-API — rotating the admin means deploying a new contract instance. See
+**Admin immutability (Issue #97) and rotation (Issue #195).** The admin address
+set here cannot be overwritten by `initialize` again (a second call always fails
+with `AlreadyInitialized`). Admin rotation is now supported via the two-step
+`propose_admin_transfer` → `execute_admin_transfer` flow — see
 [SECURITY.md § Admin Key Management](SECURITY.md#admin-key-management).
 
 ```bash
@@ -1017,6 +1020,38 @@ the previous role must track it from the corresponding `RoleGrantedEvent`.
 
 ---
 
+### AdminTransferProposedEvent (Issue #195)
+
+```
+topics: ["admin_transfer_proposed_event", new_admin]
+data:   { proposed_by, executable_at, timestamp }
+```
+
+Emitted when `propose_admin_transfer` is called. `new_admin` is indexed as a
+topic for efficient filtering. `executable_at` is the earliest timestamp at
+which `execute_admin_transfer` may succeed.
+
+### AdminTransferCancelledEvent (Issue #195)
+
+```
+topics: ["admin_transfer_cancelled_event", cancelled_by]
+data:   { timestamp }
+```
+
+Emitted when the current admin cancels a pending transfer proposal.
+
+### AdminTransferExecutedEvent (Issue #195)
+
+```
+topics: ["admin_transfer_executed_event", new_admin]
+data:   { old_admin, timestamp }
+```
+
+Emitted when the proposed new admin successfully accepts the transfer. After
+this event `ADMIN_KEY` points at `new_admin`.
+
+---
+
 ### `version() -> (u32, u32, u32)`
 
 Returns the deployed contract version as `(major, minor, patch)`.
@@ -1058,6 +1093,148 @@ Rules:
 stellar contract invoke --id $ID --source deployer --network testnet \
   -- is_compatible --major 1 --minor 0 --patch 0
 ```
+
+---
+
+## Admin Transfer Functions (Issue #195)
+
+### `propose_admin_transfer(new_admin: Address, delay_seconds: u64) -> Result<(), ContractError>`
+
+Proposes a transfer of admin rights to `new_admin` with a mandatory delay.
+
+| | |
+|---|---|
+| **Auth** | Contract admin |
+| **Mutates** | Yes |
+| **Errors** | `NotInitialized`, `Paused`, `NotAuthorized`, `ZeroAddress` |
+| **Events** | `AdminTransferProposedEvent` |
+
+A second call while a proposal is pending **overwrites** it (correcting address or delay is allowed during the window). The current admin remains the only admin throughout.
+
+### `cancel_admin_transfer() -> Result<(), ContractError>`
+
+Cancels a pending admin transfer proposal. No-op if no proposal is pending.
+
+| | |
+|---|---|
+| **Auth** | Contract admin |
+| **Mutates** | Yes |
+| **Errors** | `NotInitialized`, `NotAuthorized` |
+| **Events** | `AdminTransferCancelledEvent` |
+
+### `execute_admin_transfer(caller: Address) -> Result<(), ContractError>`
+
+Accepts the pending transfer. Must be called by the proposed new admin after the delay elapses.
+
+| | |
+|---|---|
+| **Auth** | `caller` must be the proposed new admin |
+| **Mutates** | Yes — atomically rotates `ADMIN_KEY`, removes old admin's `Role::Admin`, grants `Role::Admin` to the new admin |
+| **Errors** | `NotInitialized`, `Paused`, `NoPendingAdminTransfer`, `NotAuthorized`, `AdminTransferDelayActive` |
+| **Events** | `AdminTransferExecutedEvent` |
+
+### `get_admin_transfer() -> Option<AdminTransferProposal>`
+
+Returns the pending admin transfer proposal, or `None` if no transfer is pending.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Mutates** | No |
+
+```rust
+struct AdminTransferProposal {
+    new_admin: Address,
+    proposed_by: Address,
+    proposed_at: u64,
+    executable_at: u64,
+}
+```
+
+---
+
+## Pending Re-verification Functions (Issue #208)
+
+### `get_pending_reverify(github_username: String) -> Result<bool, ContractError>`
+
+Returns whether `github_username` has a pending re-verification flag.
+
+The flag is set automatically when a verified user re-registers to a different
+Stellar address, invalidating their prior verification. It is cleared once
+the record is `verify`'d again. Returns `false` for unknown usernames and
+removed users. Works while the contract is paused.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Mutates** | No |
+| **Errors** | `NotInitialized` |
+
+### `get_pending_reverify_page(offset: u32, limit: u32) -> Result<Vec<String>, ContractError>`
+
+Returns a page of usernames that have a pending re-verification flag set.
+`limit` is capped at `MAX_PAGE_LIMIT` (100). Works while the contract is paused.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Mutates** | No |
+| **Errors** | `NotInitialized` |
+
+**Dashboard sync note:** Poll this endpoint to discover which contributors need
+a fresh off-chain GitHub identity check after an address change. See
+[DASHBOARD_SYNC.md § Pending Re-verification](DASHBOARD_SYNC.md#pending-re-verification-issue-208).
+
+---
+
+## Attestation-Required Config (Issue #198)
+
+### `set_attestation_required(required: bool) -> Result<(), ContractError>`
+
+Configures whether a published attestation is mandatory before `upgrade`.
+
+When `required = true`, `upgrade` fails with `AttestationRequired` (code 20)
+if no valid attestation is published. When `required = false` (default),
+unattested upgrades are allowed and provenance notes them as such.
+
+| | |
+|---|---|
+| **Auth** | Contract admin |
+| **Mutates** | Yes |
+| **Errors** | `NotInitialized`, `NotAuthorized` |
+
+**Since:** added in Issue #198. Existing deployments default to `false`.
+
+### `is_attestation_required() -> bool`
+
+Returns whether WASM attestation is required before upgrade. Defaults to `false`.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Mutates** | No |
+
+---
+
+## batch_remove Return Value (Issue #205)
+
+`batch_remove` returns `BatchSummary` (was previously `void` in the ABI
+documentation). Clients that ignored the return value continue to work
+without any changes. New clients should use the returned summary to
+determine partial-success outcomes without scanning events.
+
+```rust
+struct BatchSummary {
+    total: u32,       // total items attempted
+    successful: u32,  // items removed
+    failed: u32,      // items skipped (not registered, etc.)
+    success_rate: u32 // integer percentage (0–100)
+}
+```
+
+**Since:** Issue #205. The function signature in the WASM ABI changed from
+`() -> void` to `() -> BatchSummary`. Clients compiled against the old
+bindings should regenerate via `make bindings`.
 
 ---
 

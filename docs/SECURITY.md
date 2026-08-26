@@ -38,30 +38,77 @@ Related docs: [README](../README.md) · [ARCHITECTURE](ARCHITECTURE.md) · [DEPL
 
 ## Admin Key Management
 
-The admin address is **immutable** after `initialize` (Issue #97). `initialize`
-is the only entry point that writes the `ADMIN_KEY` storage slot, and it does
-so exactly once: a second call fails with `AlreadyInitialized` regardless of
-which admin address it names. No other public function in the ABI — `pause`,
-`set_role`, `set_cooldown`, `migrate`, `upgrade`, etc. — mutates `ADMIN_KEY`.
-There is deliberately no admin-transfer API (see Notes on Issue #97); rotation
-means redeploying a new instance.
+The admin address is **immutable** after `initialize` unless rotated via the
+two-step admin transfer flow introduced in Issue #195.
 
-Regression coverage in `src/lib.rs`:
+### Two-step admin rotation (Issue #195)
 
-- `test_double_initialize_rejected_after_successful_init`,
-  `test_issue_97_second_initialize_rejected_with_different_admin` — a second
-  `initialize` always fails, even with a different admin address.
-- `test_issue_97_admin_unchanged_across_unrelated_operations` — the original
-  admin remains the only recognized admin across pause/unpause, role grants,
-  cooldown changes, verify, and migration.
+Admin rotation is a **propose → delay → accept** flow. There is never a window
+with two live admins:
+
+1. **Propose** — the current admin calls `propose_admin_transfer(new_admin, delay_seconds)`.
+   The proposal is written to chain and `AdminTransferProposedEvent` is emitted.
+   During the delay the current admin remains the only admin.
+2. **Observe / cancel** — watchers have `delay_seconds` to detect and respond.
+   The current admin may call `cancel_admin_transfer()` at any point before
+   execution to abort the proposal (emits `AdminTransferCancelledEvent`).
+   A second `propose_admin_transfer` call overwrites the first — useful for
+   correcting a typo during the window.
+3. **Accept** — after the delay elapses, the **proposed new admin** calls
+   `execute_admin_transfer(caller)` and signs. `ADMIN_KEY` is atomically
+   rotated: the old admin's `Role::Admin` entry is removed and the new admin
+   receives it. `AdminTransferExecutedEvent` is emitted.
+
+Threat-model properties:
+- A compromised admin key can only propose a transfer, not execute it — the
+  candidate address must also sign `execute_admin_transfer`.
+- Self-transfer is not explicitly blocked (the admin may rotate to themselves
+  with a delay), but produces no effective change.
+- The zero/burn address is rejected at proposal time (`ZeroAddress`).
+- Pause during a pending proposal does not affect the proposal storage — the
+  delay timer continues. However, `execute_admin_transfer` checks
+  `require_not_paused`, so execution is blocked while paused.
+- `get_admin_transfer()` exposes the pending proposal for monitoring.
+
+### Legacy note (pre-#195)
+
+Before Issue #195, `ADMIN_KEY` was set once in `initialize` with no
+transfer API. Rotation meant redeploying a new instance. The immutable-admin
+design and its regression tests are preserved: `test_double_initialize_rejected_after_successful_init`,
+`test_issue_97_second_initialize_rejected_with_different_admin`, and
+`test_issue_97_admin_unchanged_across_unrelated_operations` continue to pass.
 
 Recommendations:
 
 - Use a **multisig** or **smart account** as the admin G-address
+- Set a meaningful `delay_seconds` (e.g. 86400 = 24 h) to give watchers time
+  to detect unexpected proposals
 - Never commit private keys or seed phrases
-- Rotate operational keys via deploying a new contract instance if admin is compromised (no on-chain admin transfer in v0.1)
+- Monitor `AdminTransferProposedEvent` in your indexer
 
-## Pause Semantics During Active Waves
+### Two-step WASM upgrade (Issue #198)
+
+The attestation flow (`attest_upgrade` → `upgrade`) is optionally enforceable
+on-chain via `set_attestation_required(true)`.
+
+| `attestation_required` | No attestation published | Attestation matches | Expired / mismatch |
+|------------------------|--------------------------|--------------------|--------------------|
+| `false` (default) | Upgrade proceeds (unattested) | Upgrade proceeds (attested) | `AttestationExpired` / `UnattestedWasm` |
+| `true` | `AttestationRequired` (code 20) | Upgrade proceeds (attested) | `AttestationExpired` / `UnattestedWasm` |
+
+Setting `required = true` means:
+- A hot admin key cannot swap the WASM binary in a single step — it must first publish the hash via `attest_upgrade`, wait for watchers, then call `upgrade` with the same hash.
+- Clearing attestation (`clear_attestation`) and then calling `upgrade` fails with `AttestationRequired`.
+- The cooldown still applies independently.
+
+The `is_attestation_required()` read exposes the current config for monitoring and client-side enforcement.
+
+**Threat scenarios:**
+- *Compromised admin key attempts silent upgrade*: `upgrade` fails with `AttestationRequired` unless an attestation for that exact hash was published first (observable on-chain by watchers).
+- *Attacker publishes a forged attestation*: They still need admin auth on `attest_upgrade`, so a compromise of the admin key is the prerequisite — the same threat as before, but now visible before the swap.
+- *Attestation expired before upgrade*: `AttestationExpired` is returned; the stale record is cleared. The admin must re-attest with a new `expires_at`.
+
+
 
 When pause mode is active, guarded entry points fail with
 `ContractError::Paused` (code `7`). This avoids partial-wave behavior where

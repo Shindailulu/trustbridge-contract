@@ -59,6 +59,15 @@ pub enum ContractError {
     InvalidReasonCode = 15,
     /// The supplied Stellar address is the well-known zero/burn address.
     ZeroAddress = 16,
+    /// `propose_admin_transfer` was called while a transfer is already pending,
+    /// or `execute_admin_transfer` was called with no pending transfer.
+    AdminTransferPending = 17,
+    /// `execute_admin_transfer` was called before the delay has elapsed.
+    AdminTransferDelayActive = 18,
+    /// `execute_admin_transfer` was called with no pending transfer proposal.
+    NoPendingAdminTransfer = 19,
+    /// `upgrade` was called without a required attestation (attestation-required mode is on).
+    AttestationRequired = 20,
 }
 
 impl ContractError {
@@ -90,6 +99,10 @@ impl ContractError {
             14 => Some(ContractError::InvalidBatchSize),
             15 => Some(ContractError::InvalidReasonCode),
             16 => Some(ContractError::ZeroAddress),
+            17 => Some(ContractError::AdminTransferPending),
+            18 => Some(ContractError::AdminTransferDelayActive),
+            19 => Some(ContractError::NoPendingAdminTransfer),
+            20 => Some(ContractError::AttestationRequired),
             _ => None,
         }
     }
