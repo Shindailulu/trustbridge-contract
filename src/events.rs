@@ -92,6 +92,24 @@ pub struct RoleRevokedEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when the guardian or admin trips the emergency pause (Issue #196).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPausedEvent {
+    #[topic]
+    pub triggered_by: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when the admin clears the emergency pause (Issue #196).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyClearedEvent {
+    #[topic]
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
 #[cfg(test)]
 mod test {
     use crate::{TrustBridgeContract, TrustBridgeContractClient};

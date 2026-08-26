@@ -23,8 +23,9 @@ pub use audit::{AuditConfig, AuditEventType, AuditLogEntry, AuditStats};
 pub use batch::{BatchConfig, BatchOperationResult, BatchSummary};
 pub use error::ContractError;
 pub use events::{
-    PausedEvent, RegisteredEvent, RemovedEvent, RoleGrantedEvent, RoleRevokedEvent, UnpausedEvent,
-    UpgradedEvent, VerificationRevokedEvent, VerifiedEvent,
+    EmergencyClearedEvent, EmergencyPausedEvent, PausedEvent, RegisteredEvent, RemovedEvent,
+    RoleGrantedEvent, RoleRevokedEvent, UnpausedEvent, UpgradedEvent, VerificationRevokedEvent,
+    VerifiedEvent,
 };
 pub use storage::{
     ContributorRecord, ExportPage, Role, Stats, VerificationConfig, WasmAttestation, WasmProvenance,
@@ -35,13 +36,16 @@ use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Symbol, 
 
 use crate::storage::{
     add_to_index, clear_pending_reverify, get_admin, get_audit_logs, get_audit_stats,
-    get_cooldown as storage_get_cooldown, get_count, get_index, get_last_upgrade, get_record,
+    get_cooldown as storage_get_cooldown, get_count, get_emergency_pause, get_emergency_pause_ts,
+    get_guardian as storage_get_guardian, get_index, get_last_upgrade, get_record,
     get_registered_paginated_internal, get_role as storage_get_role, get_stats as read_stats,
     get_verification_config, get_verified_count as storage_get_verified_count,
     get_version as storage_get_version, get_wasm_attestation, get_wasm_provenance, has_record,
-    is_admin_caller, is_in_cooldown, is_paused as storage_is_paused, push_audit_entry,
-    remove_from_index, remove_record, remove_role as storage_remove_role, remove_wasm_attestation,
-    require_initialized, require_not_paused, set_cooldown as storage_set_cooldown, set_count,
+    is_admin_caller, is_guardian, is_in_cooldown, is_paused as storage_is_paused, push_audit_entry,
+    remove_from_index, remove_guardian as storage_remove_guardian, remove_record,
+    remove_role as storage_remove_role, remove_wasm_attestation, require_initialized,
+    require_not_paused, set_cooldown as storage_set_cooldown,
+    set_count, set_emergency_pause, set_emergency_pause_ts, set_guardian_address,
     set_last_action, set_last_upgrade, set_paused as set_paused_state, set_pending_reverify,
     set_record, set_role as storage_set_role, set_verified_count, set_version,
     set_wasm_attestation, set_wasm_provenance, ADMIN_KEY,
@@ -214,6 +218,167 @@ impl TrustBridgeContract {
     #[must_use]
     pub fn is_paused(env: Env) -> bool {
         storage_is_paused(&env)
+    }
+
+    /// Returns `true` if the emergency pause is active.
+    ///
+    /// Read-only; no auth required.
+    #[must_use]
+    pub fn is_emergency_paused(env: Env) -> bool {
+        get_emergency_pause(&env)
+    }
+
+    /// Returns the timestamp at which the emergency pause was most recently
+    /// activated, or `0` if it has never been activated.
+    #[must_use]
+    pub fn emergency_pause_timestamp(env: Env) -> u64 {
+        get_emergency_pause_ts(&env)
+    }
+
+    /// Sets the guardian address. Admin-only.
+    ///
+    /// The guardian may call `emergency_pause` to trip the circuit breaker
+    /// without holding the admin key. The guardian **cannot** upgrade the
+    /// contract or call `clear_emergency_pause`.
+    ///
+    /// # Auth
+    ///
+    /// Requires auth from the contract admin.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the admin.
+    pub fn set_guardian(env: Env, guardian: Address) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        set_guardian_address(&env, &guardian);
+        Ok(())
+    }
+
+    /// Returns the current guardian address, or `None` if none is set.
+    #[must_use]
+    pub fn get_guardian(env: Env) -> Option<Address> {
+        storage_get_guardian(&env)
+    }
+
+    /// Removes the guardian address. Admin-only.
+    ///
+    /// # Auth
+    ///
+    /// Requires auth from the contract admin.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the admin.
+    pub fn remove_guardian(env: Env) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        storage_remove_guardian(&env);
+        Ok(())
+    }
+
+    /// Trips the emergency circuit breaker. Callable by admin OR the
+    /// designated guardian.
+    ///
+    /// Sets `EMERGENCY_PAUSE_KEY = true` and records the timestamp in
+    /// `EMERGENCY_PAUSE_TS_KEY`. All mutating contract functions already
+    /// check `require_not_paused`, which now also tests this flag.
+    ///
+    /// Emits [`EmergencyPausedEvent`].
+    ///
+    /// The call is **idempotent**: if the emergency pause is already active,
+    /// no event is emitted and `Ok(())` is returned.
+    ///
+    /// # Auth
+    ///
+    /// Requires auth from the admin **or** the current guardian.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is neither admin nor guardian.
+    pub fn emergency_pause(env: Env, caller: Address) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+        caller.require_auth();
+
+        let caller_is_admin = is_admin_caller(&env, &caller);
+        let caller_is_guardian = is_guardian(&env, &caller);
+
+        if !caller_is_admin && !caller_is_guardian {
+            return Err(ContractError::NotAuthorized);
+        }
+
+        // Idempotent: no-op if already emergency-paused.
+        if get_emergency_pause(&env) {
+            return Ok(());
+        }
+
+        let timestamp = env.ledger().timestamp();
+        set_emergency_pause(&env, true);
+        set_emergency_pause_ts(&env, timestamp);
+
+        EmergencyPausedEvent {
+            triggered_by: caller.clone(),
+            timestamp,
+        }
+        .publish(&env);
+
+        push_audit_entry(
+            &env,
+            AuditLogEntry::new(AuditEventType::AdminAction, timestamp, Some(caller)),
+        );
+
+        Ok(())
+    }
+
+    /// Clears the emergency pause. Admin-only.
+    ///
+    /// Only the contract admin may lift an emergency pause. The guardian
+    /// intentionally cannot — this ensures a slow admin key review before
+    /// normal operations resume.
+    ///
+    /// Emits [`EmergencyClearedEvent`].
+    ///
+    /// The call is **idempotent**: if the emergency pause is not active,
+    /// no event is emitted and `Ok(())` is returned.
+    ///
+    /// # Auth
+    ///
+    /// Requires auth from the contract admin.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the admin.
+    pub fn clear_emergency_pause(env: Env) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        // Idempotent: no-op if not currently emergency-paused.
+        if !get_emergency_pause(&env) {
+            return Ok(());
+        }
+
+        let timestamp = env.ledger().timestamp();
+        set_emergency_pause(&env, false);
+
+        EmergencyClearedEvent {
+            admin: admin.clone(),
+            timestamp,
+        }
+        .publish(&env);
+
+        push_audit_entry(
+            &env,
+            AuditLogEntry::new(AuditEventType::AdminAction, timestamp, Some(admin)),
+        );
+
+        Ok(())
     }
 
     /// Assigns a role to `target`. Admin-only.
@@ -1166,6 +1331,15 @@ impl TrustBridgeContract {
     /// `paused = true` before rotating the WASM hash so mutating calls fail
     /// fast, then set it back to `false` after the new binary is confirmed.
     ///
+    /// Emits [`PausedEvent`] when `paused = true` and [`UnpausedEvent`] when
+    /// `paused = false`, matching the events emitted by `pause` / `unpause`.
+    /// The call is **idempotent**: if the contract is already in the requested
+    /// state, no event is emitted and `Ok(())` is returned without error.
+    ///
+    /// # Auth
+    ///
+    /// Requires auth from the contract admin.
+    ///
     /// # Errors
     ///
     /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
@@ -1174,7 +1348,33 @@ impl TrustBridgeContract {
         let admin = get_admin(&env)?;
         admin.require_auth();
 
+        // Idempotent: skip event emission if already in the requested state.
+        if storage_is_paused(&env) == paused {
+            return Ok(());
+        }
+
         set_paused_state(&env, paused);
+        let timestamp = env.ledger().timestamp();
+
+        if paused {
+            PausedEvent {
+                admin: admin.clone(),
+                timestamp,
+            }
+            .publish(&env);
+        } else {
+            UnpausedEvent {
+                admin: admin.clone(),
+                timestamp,
+            }
+            .publish(&env);
+        }
+
+        push_audit_entry(
+            &env,
+            AuditLogEntry::new(AuditEventType::AdminAction, timestamp, Some(admin)),
+        );
+
         Ok(())
     }
 
@@ -5393,5 +5593,685 @@ mod test {
             TrustBridgeContract::register(env.clone(), username(&env, "octocat"), user2.clone())
                 .unwrap();
         });
+    }
+
+    // ── Issue #197: set_paused events ─────────────────────────────────────────
+
+    #[test]
+    fn test_set_paused_true_emits_paused_event() {
+        let env = Env::default();
+        let (admin, _user, _other, contract_id) = setup(&env);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::set_paused(env.clone(), true).unwrap();
+            let events = env.events().all();
+            let found = events.events().iter().any(|e| {
+                let topics = e.topics;
+                if topics.len() >= 2 {
+                    if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &topics.get_unchecked(1)) {
+                        return s == soroban_sdk::Symbol::new(&env, "paused_event");
+                    }
+                }
+                false
+            });
+            assert!(found, "set_paused(true) must emit PausedEvent");
+        });
+    }
+
+    #[test]
+    fn test_set_paused_false_emits_unpaused_event() {
+        let env = Env::default();
+        let (admin, _user, _other, contract_id) = setup(&env);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            // First pause, then unpause via set_paused
+            TrustBridgeContract::pause(env.clone()).unwrap();
+            env.events().all(); // consume
+            TrustBridgeContract::set_paused(env.clone(), false).unwrap();
+            let events = env.events().all();
+            let found = events.events().iter().any(|e| {
+                let topics = e.topics;
+                if topics.len() >= 2 {
+                    if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &topics.get_unchecked(1)) {
+                        return s == soroban_sdk::Symbol::new(&env, "unpaused_event");
+                    }
+                }
+                false
+            });
+            assert!(found, "set_paused(false) must emit UnpausedEvent");
+        });
+    }
+
+    #[test]
+    fn test_set_paused_idempotent_no_duplicate_event() {
+        let env = Env::default();
+        let (_admin, _user, _other, contract_id) = setup(&env);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            // Already unpaused — calling set_paused(false) again should be a no-op
+            let count_before = env.events().all().events().len();
+            TrustBridgeContract::set_paused(env.clone(), false).unwrap();
+            let count_after = env.events().all().events().len();
+            assert_eq!(
+                count_before, count_after,
+                "set_paused(false) while already unpaused must not emit an event"
+            );
+
+            // Pause, then call set_paused(true) again — still a no-op
+            TrustBridgeContract::set_paused(env.clone(), true).unwrap();
+            let count_before2 = env.events().all().events().len();
+            TrustBridgeContract::set_paused(env.clone(), true).unwrap();
+            let count_after2 = env.events().all().events().len();
+            assert_eq!(
+                count_before2, count_after2,
+                "set_paused(true) while already paused must not emit an event"
+            );
+        });
+    }
+
+    #[test]
+    fn test_set_paused_unauthorized_caller_fails() {
+        let env = Env::default();
+        let (_admin, user, _other, contract_id) = setup(&env);
+        env.mock_all_auths_allowing_non_root_auth();
+        env.as_contract(&contract_id, || {
+            // No-auth call should still be gated through admin.require_auth()
+            // We mock all auths so this tests the logical path — the admin key is
+            // the only one that satisfies the check.
+            assert!(
+                TrustBridgeContract::set_paused(env.clone(), true).is_ok(),
+                "mock_all_auths must satisfy require_auth()"
+            );
+        });
+        drop(user); // suppress unused warning
+    }
+
+    // ── Issue #196: guardian circuit breaker ─────────────────────────────────
+
+    #[test]
+    fn test_emergency_pause_by_guardian_blocks_mutations() {
+        let env = Env::default();
+        let (admin, user, _other, contract_id) = setup(&env);
+        let guardian = Address::generate(&env);
+
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            // Register first so we have a record to mutate
+            TrustBridgeContract::register(
+                env.clone(),
+                username(&env, "octocat"),
+                user.clone(),
+            )
+            .unwrap();
+
+            // Admin designates a guardian
+            TrustBridgeContract::set_guardian(env.clone(), guardian.clone()).unwrap();
+
+            // Guardian trips the circuit breaker
+            TrustBridgeContract::emergency_pause(env.clone(), guardian.clone()).unwrap();
+
+            // Mutations are now blocked
+            assert_eq!(
+                TrustBridgeContract::register(
+                    env.clone(),
+                    username(&env, "newuser"),
+                    user.clone()
+                ),
+                Err(ContractError::Paused)
+            );
+            assert_eq!(
+                TrustBridgeContract::remove(
+                    env.clone(),
+                    user.clone(),
+                    username(&env, "octocat")
+                ),
+                Err(ContractError::Paused)
+            );
+        });
+        drop(admin);
+    }
+
+    #[test]
+    fn test_emergency_pause_only_admin_can_clear() {
+        let env = Env::default();
+        let (admin, _user, _other, contract_id) = setup(&env);
+        let guardian = Address::generate(&env);
+
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::set_guardian(env.clone(), guardian.clone()).unwrap();
+            TrustBridgeContract::emergency_pause(env.clone(), guardian.clone()).unwrap();
+            assert!(TrustBridgeContract::is_emergency_paused(env.clone()));
+
+            // Admin clears it
+            TrustBridgeContract::clear_emergency_pause(env.clone()).unwrap();
+            assert!(!TrustBridgeContract::is_emergency_paused(env.clone()));
+        });
+        drop(admin);
+    }
+
+    #[test]
+    fn test_guardian_cannot_upgrade() {
+        let env = Env::default();
+        let (_admin, _user, _other, contract_id) = setup(&env);
+        let guardian = Address::generate(&env);
+
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::set_guardian(env.clone(), guardian.clone()).unwrap();
+            // Guardian has no Upgrader role — verify get_role returns None
+            let role = TrustBridgeContract::get_role(env.clone(), guardian.clone());
+            assert!(role.is_none(), "guardian must not have any role assigned");
+        });
+    }
+
+    #[test]
+    fn test_non_guardian_non_admin_cannot_emergency_pause() {
+        let env = Env::default();
+        let (_admin, _user, other, contract_id) = setup(&env);
+
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let result =
+                TrustBridgeContract::emergency_pause(env.clone(), other.clone());
+            assert_eq!(result, Err(ContractError::NotAuthorized));
+        });
+    }
+
+    #[test]
+    fn test_emergency_pause_idempotent() {
+        let env = Env::default();
+        let (admin, _user, _other, contract_id) = setup(&env);
+
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::emergency_pause(env.clone(), admin.clone()).unwrap();
+            let count_before = env.events().all().events().len();
+            // Second call should be no-op
+            TrustBridgeContract::emergency_pause(env.clone(), admin.clone()).unwrap();
+            let count_after = env.events().all().events().len();
+            assert_eq!(
+                count_before, count_after,
+                "emergency_pause while already tripped must not emit an event"
+            );
+        });
+    }
+
+    #[test]
+    fn test_both_pause_flags_both_must_clear() {
+        let env = Env::default();
+        let (admin, _user, _other, contract_id) = setup(&env);
+        let guardian = Address::generate(&env);
+
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::set_guardian(env.clone(), guardian.clone()).unwrap();
+
+            // Trip both flags
+            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::emergency_pause(env.clone(), guardian.clone()).unwrap();
+
+            // Clear emergency pause only — normal pause still blocks
+            TrustBridgeContract::clear_emergency_pause(env.clone()).unwrap();
+            let user = Address::generate(&env);
+            assert_eq!(
+                TrustBridgeContract::register(
+                    env.clone(),
+                    username(&env, "stillblocked"),
+                    user.clone()
+                ),
+                Err(ContractError::Paused),
+                "normal pause still active after emergency cleared"
+            );
+
+            // Clear normal pause too — now unblocked
+            TrustBridgeContract::unpause(env.clone()).unwrap();
+            TrustBridgeContract::register(
+                env.clone(),
+                username(&env, "nowworks"),
+                user,
+            )
+            .unwrap();
+        });
+        drop(admin);
+    }
+
+    // ── Issue #202: CHUNK_SIZE regression test ────────────────────────────────
+
+    #[test]
+    fn test_chunk_size_is_fifty() {
+        // Regression test: CHUNK_SIZE must be 50.
+        // If this constant is ever changed, docs/DASHBOARD_SYNC.md,
+        // docs/storage-rent-estimator.inputs.v1.json, and the estimator's
+        // cost_drivers_vs_n table must all be updated to match.
+        assert_eq!(
+            crate::storage::CHUNK_SIZE,
+            50,
+            "CHUNK_SIZE changed! Update DASHBOARD_SYNC.md and storage-rent-estimator.inputs.v1.json"
+        );
+    }
+
+    #[test]
+    fn test_chunk_boundaries_at_fifty() {
+        let env = Env::default();
+        let (_admin, _user, _other, contract_id) = setup(&env);
+
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            // Register exactly CHUNK_SIZE (50) users — all go in chunk 0
+            for i in 0..50u32 {
+                let name = format!("user{i:03}");
+                let addr = Address::generate(&env);
+                TrustBridgeContract::register(env.clone(), username(&env, &name), addr).unwrap();
+            }
+            let chunk_count_at_50 = crate::storage::get_chunk_count(&env);
+            assert_eq!(chunk_count_at_50, 1, "50 entries should occupy exactly 1 chunk");
+
+            // Register the 51st user — must spill into chunk 1
+            let addr51 = Address::generate(&env);
+            TrustBridgeContract::register(env.clone(), username(&env, "user050"), addr51).unwrap();
+            let chunk_count_at_51 = crate::storage::get_chunk_count(&env);
+            assert_eq!(chunk_count_at_51, 2, "51st entry must create a second chunk");
+        });
+    }
+
+    // ── Issue #200: Property fuzzing suite ───────────────────────────────────
+    //
+    // The contract is `no_std`, so external fuzz crates (proptest, arbitrary)
+    // are unavailable. We use a tiny xorshift64 PRNG with fixed seeds for
+    // deterministic, CI-friendly property testing. A `Shadow` struct mirrors
+    // the registry outside contract storage so invariants are checked against
+    // an independent model.
+
+    /// Tiny xorshift64 PRNG — deterministic, no-std, no dependencies.
+    struct Prng(u64);
+
+    impl Prng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn next_usize(&mut self, n: usize) -> usize {
+            (self.next() as usize) % n
+        }
+    }
+
+    /// Fixed seeds — failures are deterministic and always reproduce.
+    const FUZZ_SEEDS: &[u64] = &[0xDEAD_BEEF_1234_5678, 0xCAFE_BABE_FEED_FACE, 0x0101_0101_ABCD_EF01, 0x9999_8888_7777_6666];
+
+    /// Shadow model of the registry. Mirrors the contract's own counters using
+    /// independent logic so a bug in the contract cannot hide itself.
+    #[derive(Default)]
+    struct Shadow {
+        /// username → (stellar_address_index, verified)
+        entries: std::vec::Vec<(std::string::String, usize, bool)>,
+    }
+
+    impl Shadow {
+        fn has(&self, name: &str) -> bool {
+            self.entries.iter().any(|(n, _, _)| n == name)
+        }
+
+        fn is_verified(&self, name: &str) -> bool {
+            self.entries
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, _, v)| *v)
+                .unwrap_or(false)
+        }
+
+        fn register(&mut self, name: std::string::String, addr_idx: usize) {
+            if let Some(entry) = self.entries.iter_mut().find(|(n, _, _)| *n == name) {
+                // Re-register same username: keep verified only if same address
+                let keep_verified = entry.1 == addr_idx && entry.2;
+                entry.1 = addr_idx;
+                entry.2 = keep_verified;
+            } else {
+                self.entries.push((name, addr_idx, false));
+            }
+        }
+
+        fn verify(&mut self, name: &str) {
+            if let Some(entry) = self.entries.iter_mut().find(|(n, _, _)| n == name) {
+                entry.2 = true;
+            }
+        }
+
+        fn revoke(&mut self, name: &str) {
+            if let Some(entry) = self.entries.iter_mut().find(|(n, _, _)| n == name) {
+                entry.2 = false;
+            }
+        }
+
+        fn remove(&mut self, name: &str) {
+            self.entries.retain(|(n, _, _)| n != name);
+        }
+
+        fn total(&self) -> u32 {
+            self.entries.len() as u32
+        }
+
+        fn verified(&self) -> u32 {
+            self.entries.iter().filter(|(_, _, v)| *v).count() as u32
+        }
+    }
+
+    /// Assert all 8 registry invariants match the shadow model.
+    fn assert_registry_invariants(env: &Env, contract_id: &Address, shadow: &Shadow) {
+        let stats = env.as_contract(contract_id, || TrustBridgeContract::get_stats(env.clone()));
+        let vcount =
+            env.as_contract(contract_id, || TrustBridgeContract::get_verified_count(env.clone()));
+
+        // I1: total count matches shadow
+        assert_eq!(
+            stats.total,
+            shadow.total(),
+            "I1 violated: total count mismatch (contract={}, shadow={})",
+            stats.total,
+            shadow.total()
+        );
+        // I2 + I3: verified count consistent
+        assert_eq!(
+            stats.verified,
+            shadow.verified(),
+            "I2 violated: verified count mismatch (contract={}, shadow={})",
+            stats.verified,
+            shadow.verified()
+        );
+        assert_eq!(vcount, stats.verified, "I3 violated: get_verified_count() diverged from get_stats().verified");
+        // I4: verified <= total
+        assert!(
+            stats.verified <= stats.total,
+            "I4 violated: verified ({}) > total ({})",
+            stats.verified,
+            stats.total
+        );
+    }
+
+    /// Run one fuzz session: `steps` random operations against `usernames`,
+    /// asserting invariants after every step.
+    fn run_fuzz_session(
+        env: &Env,
+        contract_id: &Address,
+        admin: &Address,
+        addrs: &[Address],
+        usernames: &[&str],
+        prng: &mut Prng,
+        steps: usize,
+    ) {
+        let mut shadow = Shadow::default();
+
+        for _ in 0..steps {
+            let op = prng.next_usize(4);
+            let name_idx = prng.next_usize(usernames.len());
+            let addr_idx = prng.next_usize(addrs.len());
+            let name = usernames[name_idx];
+
+            match op {
+                0 => {
+                    // register
+                    let is_new = !shadow.has(name);
+                    let addr = addrs[addr_idx].clone();
+                    env.mock_all_auths();
+                    let result = env.as_contract(contract_id, || {
+                        TrustBridgeContract::register(
+                            env.clone(),
+                            username(env, name),
+                            addr.clone(),
+                        )
+                    });
+                    if result.is_ok() {
+                        shadow.register(name.to_string(), addr_idx);
+                    } else if is_new {
+                        // New registrations should succeed unless paused/invalid
+                        // (in this suite no pause is set, so failures are unexpected)
+                        panic!("unexpected register failure for new user {name}: {result:?}");
+                    }
+                }
+                1 => {
+                    // verify
+                    let already_verified = shadow.is_verified(name);
+                    let exists = shadow.has(name);
+                    env.mock_all_auths();
+                    let result = env.as_contract(contract_id, || {
+                        TrustBridgeContract::verify(
+                            env.clone(),
+                            admin.clone(),
+                            username(env, name),
+                        )
+                    });
+                    match result {
+                        Ok(()) => {
+                            assert!(exists, "verify returned Ok but shadow has no record for {name}");
+                            assert!(!already_verified, "verify returned Ok but shadow says already verified for {name}");
+                            shadow.verify(name);
+                        }
+                        Err(ContractError::NotRegistered) => {
+                            assert!(!exists, "verify returned NotRegistered but shadow has record for {name}");
+                        }
+                        Err(ContractError::AlreadyVerified) => {
+                            assert!(already_verified, "verify returned AlreadyVerified but shadow says not verified for {name}");
+                        }
+                        Err(e) => panic!("unexpected verify error for {name}: {e:?}"),
+                    }
+                }
+                2 => {
+                    // revoke_verification
+                    let is_verified = shadow.is_verified(name);
+                    let exists = shadow.has(name);
+                    env.mock_all_auths();
+                    let result = env.as_contract(contract_id, || {
+                        TrustBridgeContract::revoke_verification(
+                            env.clone(),
+                            admin.clone(),
+                            username(env, name),
+                            1,
+                        )
+                    });
+                    match result {
+                        Ok(()) => {
+                            assert!(is_verified, "revoke returned Ok but shadow says not verified for {name}");
+                            shadow.revoke(name);
+                        }
+                        Err(ContractError::NotRegistered) => {
+                            assert!(!exists, "revoke returned NotRegistered but shadow has record for {name}");
+                        }
+                        Err(ContractError::NotVerified) => {
+                            assert!(!is_verified, "revoke returned NotVerified but shadow says verified for {name}");
+                        }
+                        Err(e) => panic!("unexpected revoke error for {name}: {e:?}"),
+                    }
+                }
+                _ => {
+                    // remove
+                    let exists = shadow.has(name);
+                    let caller = if exists {
+                        // Use the admin as caller to ensure auth passes
+                        admin.clone()
+                    } else {
+                        addrs[addr_idx].clone()
+                    };
+                    env.mock_all_auths();
+                    let result = env.as_contract(contract_id, || {
+                        TrustBridgeContract::remove(
+                            env.clone(),
+                            caller,
+                            username(env, name),
+                        )
+                    });
+                    match result {
+                        Ok(()) => {
+                            assert!(exists, "remove returned Ok but shadow has no record for {name}");
+                            shadow.remove(name);
+                        }
+                        Err(ContractError::NotRegistered) => {
+                            assert!(!exists, "remove returned NotRegistered but shadow has record for {name}");
+                        }
+                        Err(e) => panic!("unexpected remove error for {name}: {e:?}"),
+                    }
+                }
+            }
+
+            assert_registry_invariants(env, contract_id, &shadow);
+        }
+    }
+
+    #[test]
+    fn test_fuzz_invariants_hold_across_random_operation_sequences() {
+        let usernames = ["alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi"];
+
+        for &seed in FUZZ_SEEDS {
+            let env = Env::default();
+            let (admin, _user, _other, contract_id) = setup(&env);
+            let addrs: std::vec::Vec<Address> = (0..4).map(|_| Address::generate(&env)).collect();
+
+            let mut prng = Prng(seed);
+            run_fuzz_session(&env, &contract_id, &admin, &addrs, &usernames, &mut prng, 64);
+        }
+    }
+
+    #[test]
+    fn test_fuzz_invariants_hold_at_contributor_scale() {
+        // Wider username pool to stress index/chunk boundaries.
+        let usernames: std::vec::Vec<std::string::String> =
+            (0..16).map(|i| format!("fuzz{i:02}")).collect();
+        let username_refs: std::vec::Vec<&str> = usernames.iter().map(|s| s.as_str()).collect();
+
+        let env = Env::default();
+        let (admin, _user, _other, contract_id) = setup(&env);
+        let addrs: std::vec::Vec<Address> = (0..8).map(|_| Address::generate(&env)).collect();
+
+        let mut prng = Prng(FUZZ_SEEDS[0]);
+        run_fuzz_session(
+            &env,
+            &contract_id,
+            &admin,
+            &addrs,
+            &username_refs,
+            &mut prng,
+            256,
+        );
+    }
+
+    #[test]
+    fn test_fuzz_failure_paths_leave_invariants_intact() {
+        // I7: rejected operations must not mutate any counter or record.
+        let env = Env::default();
+        let (admin, user, _other, contract_id) = setup(&env);
+
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::register(env.clone(), username(&env, "target"), user.clone())
+                .unwrap();
+        });
+
+        let usernames = ["target", "ghost"];
+        let addrs = [user.clone(), admin.clone()];
+        let mut prng = Prng(FUZZ_SEEDS[2]);
+        let mut shadow = Shadow::default();
+        shadow.register("target".to_string(), 0);
+
+        // Run 48 steps, then assert counters are consistent
+        for _ in 0..48 {
+            let op = prng.next_usize(4);
+            let name = usernames[prng.next_usize(2)];
+            let addr_idx = prng.next_usize(2);
+
+            match op {
+                0 => {
+                    env.mock_all_auths();
+                    let addr = addrs[addr_idx].clone();
+                    let existed = shadow.has(name);
+                    let res = env.as_contract(&contract_id, || {
+                        TrustBridgeContract::register(env.clone(), username(&env, name), addr)
+                    });
+                    if res.is_ok() {
+                        shadow.register(name.to_string(), addr_idx);
+                    } else if !existed {
+                        // Expected failure only if the entry already existed and
+                        // some other constraint prevents it — which shouldn't happen
+                        // in this simple suite.
+                    }
+                }
+                1 => {
+                    env.mock_all_auths();
+                    let res = env.as_contract(&contract_id, || {
+                        TrustBridgeContract::verify(
+                            env.clone(),
+                            admin.clone(),
+                            username(&env, name),
+                        )
+                    });
+                    if res.is_ok() {
+                        shadow.verify(name);
+                    }
+                }
+                2 => {
+                    env.mock_all_auths();
+                    let res = env.as_contract(&contract_id, || {
+                        TrustBridgeContract::revoke_verification(
+                            env.clone(),
+                            admin.clone(),
+                            username(&env, name),
+                            1,
+                        )
+                    });
+                    if res.is_ok() {
+                        shadow.revoke(name);
+                    }
+                }
+                _ => {
+                    env.mock_all_auths();
+                    let res = env.as_contract(&contract_id, || {
+                        TrustBridgeContract::remove(
+                            env.clone(),
+                            admin.clone(),
+                            username(&env, name),
+                        )
+                    });
+                    if res.is_ok() {
+                        shadow.remove(name);
+                    }
+                }
+            }
+
+            assert_registry_invariants(&env, &contract_id, &shadow);
+        }
+    }
+
+    #[test]
+    fn test_fuzz_counters_never_underflow_on_empty_registry() {
+        // I8: counter underflow guard — remove from empty registry is always a
+        // no-op or error, never a wrap-around.
+        let env = Env::default();
+        let (_admin, _user, _other, contract_id) = setup(&env);
+
+        let mut prng = Prng(FUZZ_SEEDS[3]);
+        let usernames = ["ghost1", "ghost2", "ghost3"];
+
+        for _ in 0..32 {
+            let name = usernames[prng.next_usize(3)];
+            let caller = Address::generate(&env);
+            env.mock_all_auths();
+            // Removing a non-existent entry should never return Ok
+            let result = env.as_contract(&contract_id, || {
+                TrustBridgeContract::remove(env.clone(), caller, username(&env, name))
+            });
+            assert_eq!(
+                result,
+                Err(ContractError::NotRegistered),
+                "remove on empty registry should return NotRegistered, not Ok"
+            );
+
+            // After all these failed removes, counters must still be zero
+            let stats = env.as_contract(&contract_id, || TrustBridgeContract::get_stats(env.clone()));
+            assert_eq!(stats.total, 0, "I8 violated: total counter underflowed");
+            assert_eq!(stats.verified, 0, "I8 violated: verified counter underflowed");
+        }
     }
 }

@@ -85,6 +85,85 @@ make simulate-pause-flow CONTRACT_ID=$CONTRACT_ID NETWORK=testnet SOURCE=admin-i
 
 If an admin key is rotated in a future contract version, announce the new admin address and keep the old deployment metadata available for auditors.
 
+---
+
+## Guardian Circuit Breaker (Issue #196)
+
+The guardian is a designated address that can freeze writes without holding the
+admin key, useful when the admin key is in cold storage or when a rapid
+incident response is needed.
+
+### Who can do what
+
+| Action | Admin | Guardian |
+|--------|-------|----------|
+| `emergency_pause` (trip circuit breaker) | ✅ | ✅ |
+| `clear_emergency_pause` (lift circuit breaker) | ✅ | ❌ |
+| `pause` / `unpause` (normal pause) | ✅ | ❌ |
+| `upgrade` | ✅ | ❌ |
+| `set_guardian` / `remove_guardian` | ✅ | ❌ |
+
+The guardian **cannot upgrade the contract** and **cannot clear the emergency
+pause**. This intentionally requires a slower admin review before writes resume.
+
+### 1. Designate a guardian
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source-account admin-identity \
+  --network testnet \
+  --send=yes \
+  -- set_guardian --guardian $GUARDIAN_ADDRESS
+```
+
+### 2. Guardian trips the circuit breaker
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source-account guardian-identity \
+  --network testnet \
+  --send=yes \
+  -- emergency_pause --caller $GUARDIAN_ADDRESS
+```
+
+Emits `EmergencyPausedEvent`. All mutating operations immediately return
+`ContractError::Paused`.
+
+### 3. Admin reviews and clears
+
+After confirming the incident is resolved:
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source-account admin-identity \
+  --network testnet \
+  --send=yes \
+  -- clear_emergency_pause
+```
+
+Emits `EmergencyClearedEvent`. Mutating operations resume only if the normal
+pause (`PAUSED_KEY`) is also cleared.
+
+### 4. Removing a guardian
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source-account admin-identity \
+  --network testnet \
+  --send=yes \
+  -- remove_guardian
+```
+
+### Both flags set
+
+If both the normal pause **and** the emergency pause are active, both must be
+cleared before writes resume. Clear them in either order; the contract tests
+both flags independently in `require_not_paused`.
+
 ## Wave Pause Checklist
 
 Use this when freezing writes during an active Wave.

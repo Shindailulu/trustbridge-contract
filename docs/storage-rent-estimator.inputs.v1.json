@@ -4,7 +4,7 @@
   "derived_from": {
     "storage_module": "src/storage.rs",
     "ttl_policy": "Wave #7 (LEDGERS_PER_DAY * 30 / * 90)",
-    "chunked_index": "Issue #2 / docs/DASHBOARD_SYNC.md (CHUNK_SIZE = 100)",
+    "chunked_index": "Issue #2 / docs/DASHBOARD_SYNC.md (CHUNK_SIZE = 50)",
     "economics_doc_issue": 98,
     "economics_doc_path": null,
     "economics_doc_note": "No dedicated #98 economics document is checked in yet; link it here when published."
@@ -23,7 +23,7 @@
       ]
     },
     "layout": {
-      "chunk_size": 100,
+      "chunk_size": 50,
       "per_user_persistent_keys": [
         {
           "symbol": "reg",
@@ -77,9 +77,9 @@
     "cost_drivers_vs_n": [
       { "n": 1, "reg_entries": 1, "chunk_entries": 1, "approx_persistent_ex_roles_lastact": 2 },
       { "n": 10, "reg_entries": 10, "chunk_entries": 1, "approx_persistent_ex_roles_lastact": 11 },
-      { "n": 100, "reg_entries": 100, "chunk_entries": 1, "approx_persistent_ex_roles_lastact": 101 },
-      { "n": 500, "reg_entries": 500, "chunk_entries": 5, "approx_persistent_ex_roles_lastact": 505 },
-      { "n": 1000, "reg_entries": 1000, "chunk_entries": 10, "approx_persistent_ex_roles_lastact": 1010 }
+      { "n": 100, "reg_entries": 100, "chunk_entries": 2, "approx_persistent_ex_roles_lastact": 102 },
+      { "n": 500, "reg_entries": 500, "chunk_entries": 10, "approx_persistent_ex_roles_lastact": 510 },
+      { "n": 1000, "reg_entries": 1000, "chunk_entries": 20, "approx_persistent_ex_roles_lastact": 1020 }
     ]
   },
   "off_chain_indexer": {

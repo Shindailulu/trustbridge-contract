@@ -58,7 +58,7 @@ failure.
 ## How the Fuzzing Works
 
 The suite lives alongside the unit tests in `src/lib.rs` under the
-`// === Invariant property fuzzing` section.
+`// === Issue #200: Property fuzzing suite` section.
 
 - **No external fuzzing crate.** The contract is `#![no_std]`, which rules out
   `proptest` and `arbitrary`. The suite uses a small xorshift64 generator
@@ -81,6 +81,7 @@ The suite lives alongside the unit tests in `src/lib.rs` under the
 ```bash
 cargo test fuzz              # invariant suite only
 cargo test                   # full suite
+make fuzz                    # same as cargo test fuzz (Makefile target)
 make check                   # fmt + clippy + test + build
 ```
 
@@ -88,10 +89,10 @@ make check                   # fmt + clippy + test + build
 
 | Test | Steps | Purpose |
 |------|-------|---------|
-| `test_fuzz_invariants_hold_across_random_operation_sequences` | 4 seeds x 64 | Broad operation mixing |
-| `test_fuzz_invariants_hold_at_contributor_scale` | 256 | Repeated churn on every username slot |
-| `test_fuzz_failure_paths_leave_invariants_intact` | 48 | Rejected operations are side-effect free |
-| `test_fuzz_counters_never_underflow_on_empty_registry` | 32 | Saturating-arithmetic guard |
+| `test_fuzz_invariants_hold_across_random_operation_sequences` | 4 seeds × 64 | Broad operation mixing |
+| `test_fuzz_invariants_hold_at_contributor_scale` | 256 | Repeated churn on 16-username pool (stresses chunk boundaries) |
+| `test_fuzz_failure_paths_leave_invariants_intact` | 48 | Rejected operations are side-effect free (I7) |
+| `test_fuzz_counters_never_underflow_on_empty_registry` | 32 | Saturating-arithmetic guard (I8) |
 
 ### Extending the suite
 

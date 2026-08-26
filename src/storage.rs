@@ -24,11 +24,12 @@ pub const PAUSED_KEY: Symbol = symbol_short!("pause");
 pub const COOLDOWN_KEY: Symbol = symbol_short!("cdown");
 // Pending reverify flag per username
 pub const PENDING_REVERIFY_KEY: Symbol = symbol_short!("pend_rev");
-// Emergency pause flag and timestamp
-#[allow(dead_code)]
+// Emergency pause flag and timestamp — wired as guardian circuit breaker (Issue #196)
 pub const EMERGENCY_PAUSE_KEY: Symbol = symbol_short!("emrg_ps");
-#[allow(dead_code)]
 pub const EMERGENCY_PAUSE_TS_KEY: Symbol = symbol_short!("emerg_ts");
+/// Storage key for the designated guardian address (Issue #196).
+/// The guardian may trip the emergency pause but may NOT upgrade the contract.
+pub const GUARDIAN_KEY: Symbol = symbol_short!("guardian");
 pub const LAST_UPG_KEY: Symbol = symbol_short!("lastupg");
 pub const VER_KEY: Symbol = symbol_short!("ver");
 pub const ROLE_KEY: Symbol = symbol_short!("role");
@@ -503,7 +504,6 @@ pub fn get_cooldown(env: &Env) -> u64 {
     env.storage().instance().get(&COOLDOWN_KEY).unwrap_or(0)
 }
 
-#[allow(dead_code)]
 pub fn get_emergency_pause(env: &Env) -> bool {
     env.storage()
         .instance()
@@ -511,12 +511,10 @@ pub fn get_emergency_pause(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
-#[allow(dead_code)]
 pub fn set_emergency_pause(env: &Env, flag: bool) {
     env.storage().instance().set(&EMERGENCY_PAUSE_KEY, &flag);
 }
 
-#[allow(dead_code)]
 pub fn get_emergency_pause_ts(env: &Env) -> u64 {
     env.storage()
         .instance()
@@ -524,9 +522,39 @@ pub fn get_emergency_pause_ts(env: &Env) -> u64 {
         .unwrap_or(0)
 }
 
-#[allow(dead_code)]
 pub fn set_emergency_pause_ts(env: &Env, ts: u64) {
     env.storage().instance().set(&EMERGENCY_PAUSE_TS_KEY, &ts);
+}
+
+/// Rejects the call while the emergency pause flag is set.
+pub fn require_not_emergency_paused(env: &Env) -> Result<(), ContractError> {
+    if get_emergency_pause(env) {
+        Err(ContractError::Paused)
+    } else {
+        Ok(())
+    }
+}
+
+// ── Guardian (Issue #196) ─────────────────────────────────────────────────────
+
+/// Returns the designated guardian address, or `None` if none has been set.
+pub fn get_guardian(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&GUARDIAN_KEY)
+}
+
+/// Sets (or replaces) the guardian address. Admin-only write path.
+pub fn set_guardian_address(env: &Env, guardian: &Address) {
+    env.storage().instance().set(&GUARDIAN_KEY, guardian);
+}
+
+/// Removes the guardian address entirely.
+pub fn remove_guardian(env: &Env) {
+    env.storage().instance().remove(&GUARDIAN_KEY);
+}
+
+/// Returns `true` when `address` is the current guardian.
+pub fn is_guardian(env: &Env, address: &Address) -> bool {
+    matches!(get_guardian(env), Some(g) if g == *address)
 }
 
 pub fn set_cooldown(env: &Env, cooldown_seconds: u64) {
@@ -540,9 +568,9 @@ pub fn is_paused(env: &Env) -> bool {
     env.storage().instance().get(&PAUSED_KEY).unwrap_or(false)
 }
 
-/// Rejects the call while the contract is paused.
+/// Rejects the call while the contract is paused (normal or emergency).
 pub fn require_not_paused(env: &Env) -> Result<(), ContractError> {
-    if is_paused(env) {
+    if is_paused(env) || get_emergency_pause(env) {
         Err(ContractError::Paused)
     } else {
         Ok(())
