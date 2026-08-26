@@ -13,6 +13,24 @@ Related docs: [SECURITY](SECURITY.md) · [ABI](ABI.md) · [DEPLOYMENT](DEPLOYMEN
 
 ---
 
+## Storage TTL Maintenance (Keeper)
+
+Soroban persistent entries expire unless their TTL is extended. A registry with inactive contributors will silently lose its cold entries if not maintained.
+
+### When to run it
+Run the `ttl_keeper.sh` script periodically (e.g., weekly or monthly) to walk the entire registry and bump the TTL of every registered contributor.
+
+```bash
+CONTRACT_ID=C... SOURCE=keeper-identity NETWORK=testnet ./scripts/ttl_keeper.sh
+```
+
+**Notes:**
+- **Permissionless**: You do not need to use the contract admin key for this. Any funded identity can pay the transaction fees to extend TTLs.
+- **Batching**: The script handles batching automatically to avoid exceeding transaction limits.
+- **Dry-run**: You can pass `--dry-run` to test the script without submitting any transactions.
+
+---
+
 ## Emergency Pause Lifecycle
 
 In case of a detected security vulnerability, operational incident, or during maintenance windows, the contract admin can pause all state mutations.

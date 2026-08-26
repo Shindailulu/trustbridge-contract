@@ -5263,6 +5263,60 @@ mod test {
         });
     }
 
+    // ── TTL keeper tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extend_registry_ttl() {
+        let env = Env::default();
+        let (_admin, user1, _other, contract_id) = setup(&env);
+
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::register(env.clone(), username(&env, "octocat"), user1.clone()).unwrap();
+        });
+
+        // 1. Success path
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let usernames = soroban_sdk::vec![&env, username(&env, "octocat")];
+            let extended = TrustBridgeContract::extend_registry_ttl(env.clone(), usernames).unwrap();
+            assert_eq!(extended, 1);
+        });
+
+        // 2. Unknown username (skipped, not an error)
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let usernames = soroban_sdk::vec![&env, username(&env, "unknown")];
+            let extended = TrustBridgeContract::extend_registry_ttl(env.clone(), usernames).unwrap();
+            assert_eq!(extended, 0);
+        });
+
+        // 3. Mixed batch (some exist, some unknown)
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let usernames = soroban_sdk::vec![&env, username(&env, "unknown"), username(&env, "octocat")];
+            let extended = TrustBridgeContract::extend_registry_ttl(env.clone(), usernames).unwrap();
+            assert_eq!(extended, 1);
+        });
+
+        // 4. Invalid batch size (empty)
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let usernames = soroban_sdk::vec![&env];
+            let res = TrustBridgeContract::extend_registry_ttl(env.clone(), usernames);
+            assert_eq!(res, Err(ContractError::InvalidBatchSize));
+        });
+
+        // 5. Works while paused
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::pause(env.clone()).unwrap();
+            let usernames = soroban_sdk::vec![&env, username(&env, "octocat")];
+            let extended = TrustBridgeContract::extend_registry_ttl(env.clone(), usernames).unwrap();
+            assert_eq!(extended, 1);
+        });
+    }
+
     // ── Audit log & config_verification tests ────────────────────────────────
 
     #[test]
