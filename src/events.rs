@@ -96,21 +96,35 @@ pub struct RoleRevokedEvent {
     pub timestamp: u64,
 }
 
-/// Emitted when the guardian or admin trips the emergency pause (Issue #196).
+/// Emitted when an admin starts a challenge on a squatted username (Issue #214).
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EmergencyPausedEvent {
+pub struct ChallengeStartedEvent {
     #[topic]
-    pub triggered_by: Address,
+    pub github_username: String,
+    pub challenged_by: Address,
+    pub resolve_after: u64,
     pub timestamp: u64,
 }
 
-/// Emitted when the admin clears the emergency pause (Issue #196).
+/// Emitted when an admin cancels a pending challenge (Issue #214).
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EmergencyClearedEvent {
+pub struct ChallengeCancelledEvent {
     #[topic]
-    pub admin: Address,
+    pub github_username: String,
+    pub cancelled_by: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when an admin completes a challenge and removes the squatted
+/// registration (Issue #214).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChallengeCompletedEvent {
+    #[topic]
+    pub github_username: String,
+    pub completed_by: Address,
     pub timestamp: u64,
 }
 

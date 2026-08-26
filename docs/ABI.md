@@ -61,7 +61,47 @@ struct BatchSummary {
 enum Role {
     Admin = 1,
     Upgrader = 2,
+    /// May call `verify` only.
     Verifier = 3,
+    /// May call `revoke_verification` only (Issue #212 — Verifier/Revoker split).
+    Revoker = 4,
+}
+```
+
+**Role matrix (Issue #212):**
+
+| Role | `verify` | `revoke_verification` | `upgrade` | `set_role` |
+|------|----------|-----------------------|-----------|------------|
+| Admin | ✅ | ✅ | ✅ | ✅ |
+| Verifier | ✅ | ❌ | ❌ | ❌ |
+| Revoker | ❌ | ✅ | ❌ | ❌ |
+| Upgrader | ❌ | ❌ | ✅ | ❌ |
+
+### HealthSnapshot
+
+Returned by `get_health` (Issue #210).
+
+```rust
+struct HealthSnapshot {
+    paused: bool,
+    version: Vec<u32>,          // [major, minor, patch]
+    total: u32,
+    verified: u32,
+    cooldown_secs: u64,
+    cooldown_remaining_secs: u64,
+    attestation_present: bool,
+}
+```
+
+### ChallengeRecord
+
+Returned by `get_challenge` (Issue #214).
+
+```rust
+struct ChallengeRecord {
+    challenged_by: Address,
+    started_at: u64,
+    resolve_after: u64,
 }
 ```
 
@@ -95,12 +135,12 @@ enum Role {
 | 12 | `AttestationExpired` | Upgrade attestation's `expires_at` has passed |
 | 13 | `UnattestedWasm` | `upgrade` hash does not match the live attestation |
 | 14 | `InvalidBatchSize` | Batch call supplied zero items or more than the configured max |
-| 15 | `InvalidReasonCode` | `revoke_verification` was called with an unrecognized reason code |
+| 15 | `InvalidReasonCode` | `revoke_verification` reason_code is not a known `RevokeReason` value |
 | 16 | `ZeroAddress` | Supplied Stellar address is the well-known zero/burn address |
-| 17 | `AdminTransferPending` | A second propose while one was already pending (reserved) |
-| 18 | `AdminTransferDelayActive` | `execute_admin_transfer` called before the delay elapsed |
-| 19 | `NoPendingAdminTransfer` | `execute_admin_transfer` called with no pending proposal |
-| 20 | `AttestationRequired` | `upgrade` called without attestation when required mode is on |
+| 17 | `ChallengeAlreadyActive` | `start_challenge` called while a challenge is already open |
+| 18 | `NoChallengeActive` | `cancel_challenge` or `complete_challenge` called with no active challenge |
+| 19 | `ChallengeNotResolvable` | `complete_challenge` called before the delay has elapsed |
+| 20 | `ChallengeActive` | `register` attempted while a challenge is active on the username |
 
 `ContractError::from_code(u32)` maps every code in this table back to the typed
 variant and returns `None` for any unrecognized code. Every code round-trips
@@ -1512,3 +1552,81 @@ To fulfill a GDPR "Right to Erasure" request, a user or admin should call the `r
 - Run `stellar contract invoke --id $ID -- --help` for auto-generated help from the WASM schema
 
 See also: [Stellar CLI invoke argument types](https://developers.stellar.org/docs/tools/cli/cookbook/contract-invoke-arguments)
+
+---
+
+## New Functions (Issues #207, #210, #212, #214)
+
+### `get_health() -> Result<HealthSnapshot, ContractError>` (Issue #210)
+
+Returns a packed health snapshot for dashboards and CI probes.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Mutates** | No |
+| **Works while paused** | ✅ |
+| **Errors** | `NotInitialized` |
+
+See [CONTRACT_HEALTH.md](CONTRACT_HEALTH.md) for full reference.
+
+---
+
+### `migrate(new_version: (u32, u32, u32)) -> Result<(), ContractError>` (Issue #207)
+
+Advances the schema version and runs applicable data-migration steps.
+
+New in this release: `migrate` now executes registered migration steps, not
+just a version bump. The registered step for `v1.0.0 → v1.1.0` rewrites every
+`ContributorRecord` to normalise the `registered_at` field layout. Calling
+`migrate` twice with the same target version returns `InvalidVersion` (idempotent).
+
+| | |
+|---|---|
+| **Auth** | Admin |
+| **Mutates** | Yes |
+| **Errors** | `NotInitialized`, `Paused`, `NotAuthorized`, `InvalidVersion` |
+
+---
+
+### Challenge-period functions (Issue #214)
+
+#### `start_challenge(caller: Address, github_username: String) -> Result<(), ContractError>`
+
+Starts a challenge on a registered username. Locks the name for
+`DEFAULT_CHALLENGE_DELAY_SECS` (48 h). Re-registration is blocked while the
+challenge is active. Emits `ChallengeStartedEvent`.
+
+| | |
+|---|---|
+| **Auth** | Admin |
+| **Errors** | `NotInitialized`, `Paused`, `NotAuthorized`, `NotRegistered`, `ChallengeAlreadyActive` |
+
+#### `cancel_challenge(caller: Address, github_username: String) -> Result<(), ContractError>`
+
+Cancels a pending challenge, restoring normal registration behaviour.
+Emits `ChallengeCancelledEvent`.
+
+| | |
+|---|---|
+| **Auth** | Admin |
+| **Errors** | `NotInitialized`, `Paused`, `NotAuthorized`, `NoChallengeActive` |
+
+#### `complete_challenge(caller: Address, github_username: String) -> Result<(), ContractError>`
+
+Completes a challenge after the delay has elapsed, removing the registration.
+Emits `RemovedEvent` and `ChallengeCompletedEvent`.
+
+| | |
+|---|---|
+| **Auth** | Admin |
+| **Errors** | `NotInitialized`, `Paused`, `NotAuthorized`, `NoChallengeActive`, `ChallengeNotResolvable`, `NotRegistered` |
+
+#### `get_challenge(github_username: String) -> Option<ChallengeRecord>`
+
+Returns the active challenge record, or `None`.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Mutates** | No |

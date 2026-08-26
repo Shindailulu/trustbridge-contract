@@ -24,6 +24,8 @@ Related docs: [README](../README.md) · [ARCHITECTURE](ARCHITECTURE.md) · [DEPL
 | Counter drift from rejected calls | Invariant property fuzzing, see [REGISTRY_INVARIANTS](REGISTRY_INVARIANTS.md) |
 | Stale trust surviving a remove → re-register cycle (a new registrant inheriting the previous owner's verified status or address binding) | `remove` unconditionally clears the stored record; `register` on a removed username always starts a fresh, unverified record — see [Re-registration After Remove](#re-registration-after-remove) (Issue #93) |
 | Compromised or unpinned RPC client dependency | Crate validation checklist below |
+| Compromised Verifier key silently revoking payout eligibility | `Role::Verifier` and `Role::Revoker` are distinct — Issue #212 |
+| Admin force-removing a name without a grace period | Challenge flow enforces on-chain `resolve_after` delay — Issue #214 |
 
 ### Out of Scope (handled off-chain)
 
@@ -621,9 +623,71 @@ Do not construct CLI examples that imply a registrant can self-verify. The contr
 
 ---
 
+## Verifier / Revoker Role Separation (Issue #212)
+
+Prior to this change, `Role::Verifier` could both `verify` and
+`revoke_verification`. A single compromised key could therefore silently strip
+payout eligibility from any contributor.
+
+`Role::Verifier` — may only call `verify`.  
+`Role::Revoker` — may only call `revoke_verification`.  
+`Admin` — can still do both.
+
+**Migration for live deployments:** Existing `Role::Verifier` holders keep their
+verify permission unchanged. If an operator previously relied on a Verifier to
+also revoke, assign that address `Role::Revoker` via `set_role`.
+
+---
+
+## Challenge-Period Flow (Issue #214)
+
+Admin force-remove was previously instant and irreversible. A legitimate
+registrant could lose their name with no recourse.
+
+`start_challenge(caller, github_username)` places the name in a locked state for
+`DEFAULT_CHALLENGE_DELAY_SECS` (48 hours). During this window:
+
+- Re-registration by anyone other than the current owner is blocked.
+- The current registrant may still `remove` their own record, which clears the
+  challenge atomically — they proved ownership by signing.
+- `complete_challenge` is gated behind the delay. Calling it before `resolve_after`
+  returns `ChallengeNotResolvable`.
+
+After the delay, the admin calls `complete_challenge`, which removes the record
+and emits both `RemovedEvent` and `ChallengeCompletedEvent`.
+
+`cancel_challenge` is the escape hatch: if the registrant proves ownership off-chain
+during the window, the admin cancels the challenge and the registration is preserved.
+
+---
+
 ## On-Chain Audit Logging
 
 The contract records structured audit log entries into contract storage upon state mutations (`initialize`, `register`, `remove`, `verify`, `batch_verify`, `pause`, `unpause`, `config_verification`, `set_role`).
+
+### What IS an On-Chain Audit Log
+
+- **Structured compliance record**: An on-chain log entry (`AuditLogEntry`) persisted in instance storage recording event type (`AuditEventType`), timestamp, actor address, target username/address, and details.
+- **Operator query surface**: Callable on-chain via `get_audit_logs()` and `get_audit_stats()`.
+- **Bounded ring buffer**: Maintained up to a maximum cap (100 entries) per contract instance to stay within Soroban memory and footprint boundaries.
+
+### What IS NOT an On-Chain Audit Log
+
+- **Domain events replacement**: Audit log entries complement, but do not replace, Soroban domain events (`RegisteredEvent`, `VerifiedEvent`, `RemovedEvent`, etc.). Off-chain indexers still rely on domain events for event stream monitoring.
+- **Unbounded historical store**: Audit entries are capped on-chain. Complete long-term history across all ledgers should be collected by off-chain indexers from event topics or block archives.
+
+---
+
+## Audit Status
+
+This contract has **not** been formally audited. Use at your own risk on mainnet until an audit is completed.
+
+For production deployments, consider:
+
+- Independent security audit
+- Bug bounty program
+- Staged rollout on testnet/futurenet first
+
 
 ### What IS an On-Chain Audit Log
 

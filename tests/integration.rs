@@ -176,13 +176,19 @@ fn test_integration_role_based_access_control() {
 
 // ── Issue #12: Verifier role separation ──────────────────────────────────────
 
+/// Updated for Issue #212: Verifier verify + Revoker revoke flow.
 #[test]
 fn test_integration_verifier_role_separation() {
-    let (env, _admin, user1, verifier, contract_id) = setup_test_env();
+    let (env, admin, user1, verifier, contract_id) = setup_test_env();
+    let revoker = soroban_sdk::Address::generate(&env);
 
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
         TrustBridgeContract::set_role(env.clone(), verifier.clone(), Role::Verifier).unwrap();
+    });
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::set_role(env.clone(), revoker.clone(), Role::Revoker).unwrap();
     });
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
@@ -199,11 +205,38 @@ fn test_integration_verifier_role_separation() {
                 .verified
         );
     });
+    // Verifier cannot revoke (Issue #212 separation).
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        let res = TrustBridgeContract::revoke_verification(
+            env.clone(),
+            verifier.clone(),
+            s(&env, "octocat"),
+            1,
+        );
+        assert_eq!(res, Err(ContractError::NotAuthorized));
+    });
+    // Revoker can revoke.
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
         TrustBridgeContract::revoke_verification(
             env.clone(),
-            verifier.clone(),
+            revoker.clone(),
+            s(&env, "octocat"),
+            1,
+        )
+        .unwrap();
+    });
+    // Admin can still revoke.
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::verify(env.clone(), admin.clone(), s(&env, "octocat")).unwrap();
+    });
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::revoke_verification(
+            env.clone(),
+            admin.clone(),
             s(&env, "octocat"),
             1,
         )
@@ -750,13 +783,19 @@ fn test_integration_public_paginated_after_peer_removal() {
 // ── Issue #12: Additional verifier role separation (integration) ──────────────
 
 /// Revoking Verifier role prevents the former holder from verifying (Issue #12).
+/// Updated for Issue #212: revoke step uses Revoker role, not Verifier.
 #[test]
 fn test_integration_revoked_verifier_cannot_verify() {
-    let (env, _admin, user1, verifier, contract_id) = setup_test_env();
+    let (env, admin, user1, verifier, contract_id) = setup_test_env();
+    let revoker = soroban_sdk::Address::generate(&env);
 
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
         TrustBridgeContract::set_role(env.clone(), verifier.clone(), Role::Verifier).unwrap();
+    });
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::set_role(env.clone(), revoker.clone(), Role::Revoker).unwrap();
     });
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
@@ -766,15 +805,21 @@ fn test_integration_revoked_verifier_cannot_verify() {
     env.as_contract(&contract_id, || {
         TrustBridgeContract::verify(env.clone(), verifier.clone(), s(&env, "alice")).unwrap();
     });
+    // Use Revoker (not Verifier) to revoke (Issue #212).
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
         TrustBridgeContract::revoke_verification(
             env.clone(),
-            verifier.clone(),
+            revoker.clone(),
             s(&env, "alice"),
             1,
         )
         .unwrap();
+    });
+    // Re-verify so we can test that removing the Verifier role blocks verification.
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::verify(env.clone(), admin.clone(), s(&env, "alice")).unwrap();
     });
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
@@ -785,6 +830,17 @@ fn test_integration_revoked_verifier_cannot_verify() {
             TrustBridgeContract::get_role(env.clone(), verifier.clone()),
             None
         );
+    });
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        // Verifier role revoked — cannot revoke verification anymore either.
+        let result = TrustBridgeContract::revoke_verification(
+            env.clone(),
+            verifier.clone(),
+            s(&env, "alice"),
+            1,
+        );
+        assert_eq!(result, Err(ContractError::NotAuthorized));
     });
     env.mock_all_auths();
     env.as_contract(&contract_id, || {

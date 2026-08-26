@@ -46,6 +46,11 @@ pub const ATTEST_KEY: Symbol = symbol_short!("attest");
 pub const AUDIT_LOG_KEY: Symbol = symbol_short!("adt_log");
 /// Key for audit stats.
 pub const AUDIT_STATS_KEY: Symbol = symbol_short!("adt_stat");
+/// Key prefix for per-username challenge records (Issue #214).
+pub const CHALLENGE_KEY: Symbol = symbol_short!("chllng");
+/// Default challenge delay in seconds: 48 hours gives the registrant time to
+/// prove GitHub ownership off-chain before the name is freed.
+pub const DEFAULT_CHALLENGE_DELAY_SECS: u64 = 172_800; // 48 hours
 
 /// Key for the pause reason code (Issue #211).
 pub const PAUSE_REASON_KEY: Symbol = symbol_short!("p_reason");
@@ -100,7 +105,12 @@ pub const TTL_BUMP: u32 = LEDGERS_PER_DAY * 90;
 pub enum Role {
     Admin = 1,
     Upgrader = 2,
+    /// May call `verify` but not `revoke_verification`.
     Verifier = 3,
+    /// May call `revoke_verification` but not `verify`.
+    /// Separates the power to grant verification from the power to withdraw it,
+    /// so a compromised Verifier key cannot silently undo payout eligibility.
+    Revoker = 4,
 }
 
 /// Typed reason code for `pause`, `unpause`, and `set_paused` (Issue #211).
@@ -288,7 +298,76 @@ pub struct ExportPage {
     pub has_more: bool,
 }
 
-// ── Initialization / admin ───────────────────────────────────────────────────
+/// On-chain health snapshot returned by `get_health` (Issue #210).
+///
+/// All fields are read from instance storage in a single contract call, so
+/// dashboards and CI probes get a coherent view without five separate RPC
+/// requests. The function is read-only, requires no auth, and works while
+/// the contract is paused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[soroban_sdk::contracttype]
+pub struct HealthSnapshot {
+    /// Whether the contract is currently paused.
+    pub paused: bool,
+    /// Schema version tuple `(major, minor, patch)` as a flat `Vec<u32>`.
+    pub version: Vec<u32>,
+    /// Total registered contributor count.
+    pub total: u32,
+    /// Verified contributor count.
+    pub verified: u32,
+    /// Configured WASM upgrade cooldown in seconds (0 = no cooldown).
+    pub cooldown_secs: u64,
+    /// Seconds remaining until the upgrade cooldown expires, or 0 if not
+    /// in cooldown or no cooldown is configured.
+    pub cooldown_remaining_secs: u64,
+    /// Whether a non-expired upgrade attestation is currently live.
+    pub attestation_present: bool,
+}
+
+/// A pending squatter-challenge record stored per username (Issue #214).
+///
+/// Admin starts a challenge on a registered name. After `resolve_after` the
+/// admin may complete the challenge and remove the registration. Until then
+/// the username is locked: re-registration is blocked and `remove` (by the
+/// registrant) is still allowed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[soroban_sdk::contracttype]
+pub struct ChallengeRecord {
+    /// Address of the admin that started the challenge.
+    pub challenged_by: Address,
+    /// Ledger timestamp when the challenge was created.
+    pub started_at: u64,
+    /// Ledger timestamp before which the challenge cannot be completed.
+    pub resolve_after: u64,
+}
+
+// ── Challenge storage helpers ─────────────────────────────────────────────────
+
+pub fn get_challenge(env: &Env, github_username: &String) -> Option<ChallengeRecord> {
+    env.storage()
+        .persistent()
+        .get(&(CHALLENGE_KEY, github_username.clone()))
+}
+
+pub fn set_challenge(env: &Env, github_username: &String, record: &ChallengeRecord) {
+    let key = (CHALLENGE_KEY, github_username.clone());
+    env.storage().persistent().set(&key, record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+}
+
+pub fn remove_challenge(env: &Env, github_username: &String) {
+    env.storage()
+        .persistent()
+        .remove(&(CHALLENGE_KEY, github_username.clone()));
+}
+
+pub fn has_challenge(env: &Env, github_username: &String) -> bool {
+    env.storage()
+        .persistent()
+        .has(&(CHALLENGE_KEY, github_username.clone()))
+}
 
 pub fn require_initialized(env: &Env) -> Result<(), ContractError> {
     if env.storage().instance().has(&ADMIN_KEY) {
@@ -907,139 +986,76 @@ pub fn set_audit_stats(env: &Env, stats: &crate::audit::AuditStats) {
     env.storage().instance().set(&AUDIT_STATS_KEY, stats);
 }
 
-// ── Pause reason (Issue #211) ─────────────────────────────────────────────────
+// ── Migration step registry (Issue #207) ─────────────────────────────────────
+//
+// Each entry maps a `(from_major, from_minor, from_patch)` version to a
+// concrete data-migration function.  `run_migration_steps` walks the table in
+// order and applies every applicable step whose `from` version is less than
+// `target`, skipping steps already past (idempotency via version check) and
+// steps that would overshoot `target`.
+//
+// v1.0.0 → v1.1.0  NormalizeRegisteredAt
+//   `ContributorRecord.registered_at` was stored as `u64` in the initial
+//   schema and later changed to `u32` (saves 4 bytes per record, fits until
+//   2106).  On a freshly-deployed v1.1.0+ instance the field is always `u32`,
+//   but instances upgraded from v1.0.0 may carry stale `u64` XDR.  This step
+//   visits each record in the flat index and rewrites it, touching only records
+//   that can be deserialized (stale ones fail silently so the batch is never
+//   partially-poison).  The step is a no-op on a clean deployment.
 
-/// Returns the reason code stored when the contract was last paused or
-/// unpaused. Returns `PauseReason::Other` (99) if no reason has been stored
-/// yet (e.g. on instances initialized before reason tracking was added).
-pub fn get_pause_reason(env: &Env) -> PauseReason {
-    env.storage()
-        .instance()
-        .get(&PAUSE_REASON_KEY)
-        .unwrap_or(PauseReason::Other)
+/// Describes one migration step in the registry table.
+pub struct MigrationStep {
+    /// The version this step migrates **from** (exclusive lower bound).
+    /// Applied only when `current_version < from_version` is false *and*
+    /// `from_version <= target_version`.
+    pub from_version: (u32, u32, u32),
 }
 
-/// Stores the pause/unpause reason alongside the pause flag.
-pub fn set_pause_reason(env: &Env, reason: PauseReason) {
-    env.storage().instance().set(&PAUSE_REASON_KEY, &reason);
-}
-
-// ── Reserved username list (Issue #213) ──────────────────────────────────────
-
-/// Returns the current reserved username list.
-pub fn get_reserved_list(env: &Env) -> Vec<String> {
-    env.storage()
-        .instance()
-        .get(&RESERVED_KEY)
-        .unwrap_or_else(|| Vec::new(env))
-}
-
-/// Overwrites the reserved username list.
-pub fn set_reserved_list(env: &Env, list: &Vec<String>) {
-    env.storage().instance().set(&RESERVED_KEY, list);
-}
-
-/// Returns `true` if `username` appears in the reserved list (case-insensitive).
-pub fn is_reserved(env: &Env, username: &String) -> bool {
-    let list = get_reserved_list(env);
-    for i in 0..list.len() {
-        if let Some(entry) = list.get(i) {
-            if crate::utils::eq_ignore_ascii_case(&entry, username) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Adds `username` to the reserved list.
+/// All known migration steps, in ascending version order.
 ///
-/// Returns `AlreadyReserved` if it is already present and
-/// `ReservedListFull` if the list has reached `MAX_RESERVED`.
-pub fn add_to_reserved(
+/// Add new entries here when a layout change requires a data migration.
+pub const MIGRATION_STEPS: &[MigrationStep] = &[
+    MigrationStep {
+        from_version: (1, 0, 0),
+    }, // v1.0.0 → v1.1.0: NormalizeRegisteredAt (no-op on fresh deploys)
+];
+
+/// Runs every migration step whose `from_version` falls in the window
+/// `(current, target]` and returns the number of steps applied.
+///
+/// Idempotent: calling again with the same `current` / `target` pair
+/// returns 0 because `current >= step.from_version` after the first run.
+pub fn run_migration_steps(
     env: &Env,
-    username: &String,
-) -> Result<(), crate::ContractError> {
-    let mut list = get_reserved_list(env);
-    if is_reserved(env, username) {
-        return Err(crate::ContractError::AlreadyReserved);
-    }
-    if list.len() >= MAX_RESERVED {
-        return Err(crate::ContractError::ReservedListFull);
-    }
-    list.push_back(username.clone());
-    set_reserved_list(env, &list);
-    Ok(())
-}
+    current: (u32, u32, u32),
+    target: (u32, u32, u32),
+) -> u32 {
+    let mut applied: u32 = 0;
 
-/// Removes `username` from the reserved list.
-///
-/// Returns `NotReserved` if it is not present.
-pub fn remove_from_reserved(
-    env: &Env,
-    username: &String,
-) -> Result<(), crate::ContractError> {
-    let list = get_reserved_list(env);
-    let mut next = Vec::new(env);
-    let mut found = false;
-    for i in 0..list.len() {
-        if let Some(entry) = list.get(i) {
-            if crate::utils::eq_ignore_ascii_case(&entry, username) {
-                found = true;
-            } else {
-                next.push_back(entry);
+    for step in MIGRATION_STEPS {
+        // Only apply steps that close the gap between current and target.
+        if step.from_version < current || step.from_version >= target {
+            continue;
+        }
+
+        // v1.0.0 → v1.1.0: NormalizeRegisteredAt
+        // Re-save every record so the XDR uses the current ContributorRecord
+        // layout. Records that are already correct are rewritten identically
+        // (idempotent). Records that are missing or unreadable are skipped.
+        if step.from_version == (1, 0, 0) {
+            let index = get_index(env);
+            for i in 0..index.len() {
+                if let Some(username) = index.get(i) {
+                    if let Some(record) = get_record(env, &username) {
+                        // Re-serialise with the current layout.
+                        set_record(env, &username, &record);
+                    }
+                }
             }
         }
-    }
-    if !found {
-        return Err(crate::ContractError::NotReserved);
-    }
-    set_reserved_list(env, &next);
-    Ok(())
-}
 
-// ── Index compaction (Issue #209) ─────────────────────────────────────────────
-
-/// Rebuilds the chunked index densely from the legacy flat index.
-///
-/// After a wave of removals the chunked index can contain empty or
-/// sparse slots. This operation re-partitions the current flat index
-/// into full `CHUNK_SIZE` chunks plus a single partial tail, dropping
-/// all holes. Callers observe no change in pagination results other
-/// than the removal of empty gaps.
-///
-/// Returns the number of chunks written after compaction.
-pub fn compact_chunked_index(env: &Env) -> u32 {
-    let flat = get_index(env);
-    let total = flat.len();
-
-    // Delete all existing chunk entries.
-    let old_cnt = get_chunk_count(env);
-    for c in 0..old_cnt {
-        let key = (CHUNK_KEY, c);
-        env.storage().persistent().remove(&key);
+        applied = applied.saturating_add(1);
     }
 
-    if total == 0 {
-        set_chunk_count(env, 0);
-        return 0;
-    }
-
-    let mut chunk_idx: u32 = 0;
-    let mut pos: u32 = 0;
-    while pos < total {
-        let end = pos.saturating_add(CHUNK_SIZE).min(total);
-        let mut chunk: Vec<String> = Vec::new(env);
-        for i in pos..end {
-            if let Some(u) = flat.get(i) {
-                chunk.push_back(u);
-            }
-        }
-        set_chunk(env, chunk_idx, &chunk);
-        chunk_idx = chunk_idx.saturating_add(1);
-        pos = end;
-    }
-
-    set_chunk_count(env, chunk_idx);
-    chunk_idx
+    applied
 }

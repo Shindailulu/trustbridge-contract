@@ -24,9 +24,10 @@ Consumers:
 3. **Dashboard** — displays registry state, verification status, and stats
 4. **Admin** — verifies identities off-chain and marks them on-chain
 
-Operational monitors should compose liveness/readiness from existing read
-methods (no dedicated on-chain `health` entrypoint). See
-[CONTRACT_HEALTH.md](CONTRACT_HEALTH.md).
+Operational monitors should use `get_health` (Issue #210) for a single packed
+snapshot: pause state, schema version, registration counts, upgrade cooldown, and
+attestation presence. See [CONTRACT_HEALTH.md](CONTRACT_HEALTH.md) for the full
+reference and migration guide from manual probing.
 
 ---
 
@@ -91,8 +92,26 @@ Soroban uses explicit address authorization via `Address::require_auth()`.
 | `register` | The `stellar_address` being registered |
 | `remove` | The `caller` argument — must equal admin or registrant |
 | `get_all_registered` | Admin |
-| `verify` | Admin |
-| `get_address`, `get_stats` | None (read-only) |
+| `verify` | Admin **or** `Role::Verifier` |
+| `revoke_verification` | Admin **or** `Role::Revoker` (Issue #212) |
+| `start_challenge` / `cancel_challenge` / `complete_challenge` | Admin |
+| `get_address`, `get_stats`, `get_health` | None (read-only) |
+
+### Role matrix (Issue #212 — Verifier / Revoker split)
+
+| Role | verify | revoke_verification | upgrade | set_role |
+|------|--------|---------------------|---------|----------|
+| Admin | ✅ | ✅ | ✅ | ✅ |
+| Verifier | ✅ | ❌ | ❌ | ❌ |
+| Revoker | ❌ | ✅ | ❌ | ❌ |
+| Upgrader | ❌ | ❌ | ✅ | ❌ |
+
+Separating Verifier from Revoker prevents a compromised Verifier key from
+silently revoking payout eligibility for existing contributors.
+
+**Migration for live Verifier holders:** Existing `Role::Verifier` addresses
+keep their verify permission. If they previously relied on revoke, re-assign
+them `Role::Revoker` via `set_role`.
 
 ### Why `remove` takes a `caller` argument
 
@@ -104,6 +123,61 @@ Soroban contracts cannot inspect the transaction source account without an expli
 See [Stellar auth documentation](https://developers.stellar.org/docs/build/smart-contracts/example-contracts/auth) for background.
 
 ---
+
+## Challenge-Period Flow (Issue #214)
+
+Admin force-remove is normally instant. The challenge flow introduces a mandatory
+delay so the registrant has time to prove GitHub ownership off-chain before a name
+is freed.
+
+### State machine
+
+```
+Registered
+    │
+    │  admin: start_challenge()
+    ▼
+[ChallengeActive] ──── resolve_after not yet passed ────────────────────────┐
+    │                                                                        │
+    │  registrant: remove()  (self-remove beats the clock, challenge cleared)|
+    │  admin: cancel_challenge()                                             │
+    ▼                                                                        │
+Removed / Unlocked                                                           │
+                                                                             │
+                             resolve_after elapsed                           │
+                                  ▼                                          │
+                     admin: complete_challenge() ◄──────────────────────────┘
+                                  │
+                                  ▼
+                             Removed + ChallengeCompletedEvent
+```
+
+### Rules
+
+| Scenario | Outcome |
+|----------|---------|
+| `register` while challenge active | `ChallengeActive` error |
+| Self-remove during challenge | Allowed; clears challenge atomically |
+| `start_challenge` on already-challenged name | `ChallengeAlreadyActive` error |
+| `complete_challenge` before delay | `ChallengeNotResolvable` error |
+| Record removed during challenge window | `complete_challenge` returns `NotRegistered` |
+
+### Events
+
+| Event | Emitted by |
+|-------|-----------|
+| `ChallengeStartedEvent` | `start_challenge` |
+| `ChallengeCancelledEvent` | `cancel_challenge` |
+| `ChallengeCompletedEvent` | `complete_challenge` |
+| `RemovedEvent` | `complete_challenge` (on successful removal) |
+
+### Storage
+
+Challenge records are stored under `(Symbol("chllng"), github_username)` in
+persistent storage and TTL-extended on write. The default challenge delay is
+`DEFAULT_CHALLENGE_DELAY_SECS` (48 hours).
+
+
 
 ## Event Design
 
