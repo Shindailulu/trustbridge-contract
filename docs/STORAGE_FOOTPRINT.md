@@ -164,3 +164,51 @@ Redo this estimate if any of the following change:
 - `idx` is removed in favor of the chunked index alone (removes the N-linear
   instance-entry risk entirely; recompute the "Instance entry" column as the
   fixed ~356 B row only, with no crossover point).
+
+---
+
+## Index Compaction and Storage Footprint (Issue #209)
+
+After a sequence of `remove` calls the chunked index (`(chunk, N)` persistent
+entries) can become sparse. Each removed username leaves its chunk slot empty
+but the chunk entry itself remains — it is not deleted until the chunk is
+entirely empty. Over a full Wave season (hundreds of contributors registering
+and some percentage leaving) this means:
+
+- Chunk entries stay allocated even when most of their usernames have been
+  removed.
+- Pagination skips empty slots, but each access still pays for the ledger
+  entry reads.
+- Net effect: storage rent for chunks grows with the *peak* registration
+  count, not the *current* count.
+
+### `compact_index` (admin operation)
+
+`compact_index` (`src/lib.rs`) rebuilds the chunked index densely from the
+current flat `idx` list. It:
+
+1. Deletes all existing `(chunk, N)` persistent entries.
+2. Re-partitions the current `idx` list into full `CHUNK_SIZE` chunks plus a
+   single partial tail.
+
+After compaction the number of chunk entries equals
+`ceil(current_count / CHUNK_SIZE)`, which is the theoretical minimum.
+This reclaims one persistent entry per `CHUNK_SIZE` slots that were entirely
+empty.
+
+**When to run:** After a bulk `batch_remove` operation at the end of a Wave
+season, or any time `get_stats().total` drops significantly below the peak
+registration count that created the existing chunks.
+
+**Instruction budget:** Compaction reads the flat `idx` entry once, deletes
+`old_chunk_count` persistent entries, and writes `new_chunk_count` entries.
+For a registry of N users with C chunks, this is roughly
+`(N / CHUNK_SIZE) + (old_C + new_C)` storage operations — well within the
+Soroban per-transaction instruction limit for registries up to ~50,000 users
+at the current `CHUNK_SIZE = 50`.
+
+**Tests:** `tests/integration.rs` under the `// Issue #209` section; run with:
+
+```bash
+cargo test compact
+```

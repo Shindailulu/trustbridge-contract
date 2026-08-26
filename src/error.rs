@@ -19,6 +19,13 @@ use soroban_sdk::contracterror;
 /// | 9 | `InvalidVersion` | `migrate` |
 /// | 10 | `InvalidRole` | `set_role` |
 /// | 11 | `InvalidUsername` | `register` |
+/// | 15 | `InvalidReasonCode` | `revoke_verification` |
+/// | 16 | `ZeroAddress` | `register` |
+/// | 17 | `InvalidPauseReason` | `pause`, `unpause`, `set_paused` |
+/// | 18 | `AlreadyReserved` | `add_reserved` |
+/// | 19 | `NotReserved` | `remove_reserved` |
+/// | 20 | `UsernameReserved` | `register` |
+/// | 21 | `ReservedListFull` | `add_reserved` |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -59,15 +66,16 @@ pub enum ContractError {
     InvalidReasonCode = 15,
     /// The supplied Stellar address is the well-known zero/burn address.
     ZeroAddress = 16,
-    /// `propose_admin_transfer` was called while a transfer is already pending,
-    /// or `execute_admin_transfer` was called with no pending transfer.
-    AdminTransferPending = 17,
-    /// `execute_admin_transfer` was called before the delay has elapsed.
-    AdminTransferDelayActive = 18,
-    /// `execute_admin_transfer` was called with no pending transfer proposal.
-    NoPendingAdminTransfer = 19,
-    /// `upgrade` was called without a required attestation (attestation-required mode is on).
-    AttestationRequired = 20,
+    /// `pause` / `unpause` / `set_paused` were called with an unrecognized reason code.
+    InvalidPauseReason = 17,
+    /// `add_reserved` was called with a username that is already reserved.
+    AlreadyReserved = 18,
+    /// `remove_reserved` was called with a username that is not reserved.
+    NotReserved = 19,
+    /// `register` was called with a username on the reserved list.
+    UsernameReserved = 20,
+    /// The reserved list has reached its maximum allowed size.
+    ReservedListFull = 21,
 }
 
 impl ContractError {
@@ -99,10 +107,11 @@ impl ContractError {
             14 => Some(ContractError::InvalidBatchSize),
             15 => Some(ContractError::InvalidReasonCode),
             16 => Some(ContractError::ZeroAddress),
-            17 => Some(ContractError::AdminTransferPending),
-            18 => Some(ContractError::AdminTransferDelayActive),
-            19 => Some(ContractError::NoPendingAdminTransfer),
-            20 => Some(ContractError::AttestationRequired),
+            17 => Some(ContractError::InvalidPauseReason),
+            18 => Some(ContractError::AlreadyReserved),
+            19 => Some(ContractError::NotReserved),
+            20 => Some(ContractError::UsernameReserved),
+            21 => Some(ContractError::ReservedListFull),
             _ => None,
         }
     }

@@ -46,6 +46,15 @@ pub const AUDIT_LOG_KEY: Symbol = symbol_short!("adt_log");
 /// Key for audit stats.
 pub const AUDIT_STATS_KEY: Symbol = symbol_short!("adt_stat");
 
+/// Key for the pause reason code (Issue #211).
+pub const PAUSE_REASON_KEY: Symbol = symbol_short!("p_reason");
+
+/// Key for the reserved username set (Issue #213).
+pub const RESERVED_KEY: Symbol = symbol_short!("reserved");
+
+/// Maximum entries in the reserved username list (Issue #213).
+pub const MAX_RESERVED: u32 = 200;
+
 /// Key for the version stored at `storage::get_version` / `set_version`.
 /// Aliased as VERSION_KEY for callers that use that name.
 pub const VERSION_KEY: Symbol = VER_KEY;
@@ -91,6 +100,54 @@ pub enum Role {
     Admin = 1,
     Upgrader = 2,
     Verifier = 3,
+}
+
+/// Typed reason code for `pause`, `unpause`, and `set_paused` (Issue #211).
+///
+/// Stored on-chain alongside the pause flag so incident reviewers can
+/// distinguish a maintenance pause from a security freeze without replaying
+/// event history. All mutation entry points that flip the pause flag require
+/// a valid `PauseReason`; unknown codes fail with
+/// [`ContractError::InvalidPauseReason`].
+///
+/// | Code | Name | When to use |
+/// |------|------|-------------|
+/// | 1 | `Maintenance` | Planned upgrade window or admin maintenance |
+/// | 2 | `SecurityIncident` | Freeze after a detected exploit or suspicious activity |
+/// | 3 | `RegulatoryHold` | Compliance or legal hold requirement |
+/// | 4 | `Unpause` | Resuming normal operation (used with `unpause`) |
+/// | 99 | `Other` | Any reason not covered above |
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[soroban_sdk::contracttype]
+#[repr(u32)]
+pub enum PauseReason {
+    Maintenance = 1,
+    SecurityIncident = 2,
+    RegulatoryHold = 3,
+    Unpause = 4,
+    Other = 99,
+}
+
+impl PauseReason {
+    /// Returns `true` if `code` maps to a known `PauseReason` discriminant.
+    #[must_use]
+    pub fn is_valid(code: u32) -> bool {
+        matches!(code, 1 | 2 | 3 | 4 | 99)
+    }
+
+    /// Converts a raw u32 to the corresponding `PauseReason`, or `None` for
+    /// unrecognized codes.
+    #[must_use]
+    pub fn from_code(code: u32) -> Option<Self> {
+        match code {
+            1 => Some(PauseReason::Maintenance),
+            2 => Some(PauseReason::SecurityIncident),
+            3 => Some(PauseReason::RegulatoryHold),
+            4 => Some(PauseReason::Unpause),
+            99 => Some(PauseReason::Other),
+            _ => None,
+        }
+    }
 }
 
 /// An on-chain record for a registered contributor.
@@ -820,4 +877,141 @@ pub fn get_audit_stats(env: &Env) -> crate::audit::AuditStats {
 
 pub fn set_audit_stats(env: &Env, stats: &crate::audit::AuditStats) {
     env.storage().instance().set(&AUDIT_STATS_KEY, stats);
+}
+
+// ── Pause reason (Issue #211) ─────────────────────────────────────────────────
+
+/// Returns the reason code stored when the contract was last paused or
+/// unpaused. Returns `PauseReason::Other` (99) if no reason has been stored
+/// yet (e.g. on instances initialized before reason tracking was added).
+pub fn get_pause_reason(env: &Env) -> PauseReason {
+    env.storage()
+        .instance()
+        .get(&PAUSE_REASON_KEY)
+        .unwrap_or(PauseReason::Other)
+}
+
+/// Stores the pause/unpause reason alongside the pause flag.
+pub fn set_pause_reason(env: &Env, reason: PauseReason) {
+    env.storage().instance().set(&PAUSE_REASON_KEY, &reason);
+}
+
+// ── Reserved username list (Issue #213) ──────────────────────────────────────
+
+/// Returns the current reserved username list.
+pub fn get_reserved_list(env: &Env) -> Vec<String> {
+    env.storage()
+        .instance()
+        .get(&RESERVED_KEY)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Overwrites the reserved username list.
+pub fn set_reserved_list(env: &Env, list: &Vec<String>) {
+    env.storage().instance().set(&RESERVED_KEY, list);
+}
+
+/// Returns `true` if `username` appears in the reserved list (case-insensitive).
+pub fn is_reserved(env: &Env, username: &String) -> bool {
+    let list = get_reserved_list(env);
+    for i in 0..list.len() {
+        if let Some(entry) = list.get(i) {
+            if crate::utils::eq_ignore_ascii_case(&entry, username) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Adds `username` to the reserved list.
+///
+/// Returns `AlreadyReserved` if it is already present and
+/// `ReservedListFull` if the list has reached `MAX_RESERVED`.
+pub fn add_to_reserved(
+    env: &Env,
+    username: &String,
+) -> Result<(), crate::ContractError> {
+    let mut list = get_reserved_list(env);
+    if is_reserved(env, username) {
+        return Err(crate::ContractError::AlreadyReserved);
+    }
+    if list.len() >= MAX_RESERVED {
+        return Err(crate::ContractError::ReservedListFull);
+    }
+    list.push_back(username.clone());
+    set_reserved_list(env, &list);
+    Ok(())
+}
+
+/// Removes `username` from the reserved list.
+///
+/// Returns `NotReserved` if it is not present.
+pub fn remove_from_reserved(
+    env: &Env,
+    username: &String,
+) -> Result<(), crate::ContractError> {
+    let list = get_reserved_list(env);
+    let mut next = Vec::new(env);
+    let mut found = false;
+    for i in 0..list.len() {
+        if let Some(entry) = list.get(i) {
+            if crate::utils::eq_ignore_ascii_case(&entry, username) {
+                found = true;
+            } else {
+                next.push_back(entry);
+            }
+        }
+    }
+    if !found {
+        return Err(crate::ContractError::NotReserved);
+    }
+    set_reserved_list(env, &next);
+    Ok(())
+}
+
+// ── Index compaction (Issue #209) ─────────────────────────────────────────────
+
+/// Rebuilds the chunked index densely from the legacy flat index.
+///
+/// After a wave of removals the chunked index can contain empty or
+/// sparse slots. This operation re-partitions the current flat index
+/// into full `CHUNK_SIZE` chunks plus a single partial tail, dropping
+/// all holes. Callers observe no change in pagination results other
+/// than the removal of empty gaps.
+///
+/// Returns the number of chunks written after compaction.
+pub fn compact_chunked_index(env: &Env) -> u32 {
+    let flat = get_index(env);
+    let total = flat.len();
+
+    // Delete all existing chunk entries.
+    let old_cnt = get_chunk_count(env);
+    for c in 0..old_cnt {
+        let key = (CHUNK_KEY, c);
+        env.storage().persistent().remove(&key);
+    }
+
+    if total == 0 {
+        set_chunk_count(env, 0);
+        return 0;
+    }
+
+    let mut chunk_idx: u32 = 0;
+    let mut pos: u32 = 0;
+    while pos < total {
+        let end = pos.saturating_add(CHUNK_SIZE).min(total);
+        let mut chunk: Vec<String> = Vec::new(env);
+        for i in pos..end {
+            if let Some(u) = flat.get(i) {
+                chunk.push_back(u);
+            }
+        }
+        set_chunk(env, chunk_idx, &chunk);
+        chunk_idx = chunk_idx.saturating_add(1);
+        pos = end;
+    }
+
+    set_chunk_count(env, chunk_idx);
+    chunk_idx
 }

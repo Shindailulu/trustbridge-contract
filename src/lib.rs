@@ -28,8 +28,8 @@ pub use events::{
     UpgradedEvent, UpgradeAttestedEvent, AttestationClearedEvent, VerificationRevokedEvent, VerifiedEvent,
 };
 pub use storage::{
-    AdminTransferProposal, ContributorRecord, ExportPage, Role, Stats, VerificationConfig,
-    WasmAttestation, WasmProvenance,
+    ContributorRecord, ExportPage, PauseReason, Role, Stats, VerificationConfig, WasmAttestation,
+    WasmProvenance,
 };
 pub use version::Version;
 
@@ -154,16 +154,24 @@ impl TrustBridgeContract {
     ///
     /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
     /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
-    pub fn pause(env: Env) -> Result<(), ContractError> {
+    /// - [`ContractError::InvalidPauseReason`] if `reason_code` is not a valid `PauseReason`.
+    pub fn pause(env: Env, reason_code: u32) -> Result<(), ContractError> {
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
 
+        if !PauseReason::is_valid(reason_code) {
+            return Err(ContractError::InvalidPauseReason);
+        }
+        let reason = PauseReason::from_code(reason_code).unwrap_or(PauseReason::Other);
+
         set_paused_state(&env, true);
+        crate::storage::set_pause_reason(&env, reason);
         let timestamp = env.ledger().timestamp();
         PausedEvent {
             admin: admin.clone(),
             timestamp,
+            reason_code,
         }
         .publish(&env);
 
@@ -189,16 +197,24 @@ impl TrustBridgeContract {
     ///
     /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
     /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
-    pub fn unpause(env: Env) -> Result<(), ContractError> {
+    /// - [`ContractError::InvalidPauseReason`] if `reason_code` is not a valid `PauseReason`.
+    pub fn unpause(env: Env, reason_code: u32) -> Result<(), ContractError> {
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
 
+        if !PauseReason::is_valid(reason_code) {
+            return Err(ContractError::InvalidPauseReason);
+        }
+        let reason = PauseReason::from_code(reason_code).unwrap_or(PauseReason::Other);
+
         set_paused_state(&env, false);
+        crate::storage::set_pause_reason(&env, reason);
         let timestamp = env.ledger().timestamp();
         UnpausedEvent {
             admin: admin.clone(),
             timestamp,
+            reason_code,
         }
         .publish(&env);
 
@@ -218,6 +234,13 @@ impl TrustBridgeContract {
     #[must_use]
     pub fn is_paused(env: Env) -> bool {
         storage_is_paused(&env)
+    }
+
+    /// Returns the reason code stored when the contract was last paused or
+    /// unpaused. Returns `PauseReason::Other` (99) if no reason has been stored.
+    #[must_use]
+    pub fn get_pause_reason(env: Env) -> PauseReason {
+        crate::storage::get_pause_reason(&env)
     }
 
     /// Assigns a role to `target`. Admin-only.
@@ -785,6 +808,12 @@ impl TrustBridgeContract {
             return Err(ContractError::ZeroAddress);
         }
 
+        // Reject reserved usernames before auth so the caller gets a clear
+        // error even without a valid signature, and before any write.
+        if crate::storage::is_reserved(&env, &github_username) {
+            return Err(ContractError::UsernameReserved);
+        }
+
         stellar_address.require_auth();
 
         let timestamp = env.ledger().timestamp();
@@ -1198,15 +1227,24 @@ impl TrustBridgeContract {
     /// `paused = true` before rotating the WASM hash so mutating calls fail
     /// fast, then set it back to `false` after the new binary is confirmed.
     ///
+    /// `reason_code` must be a valid `PauseReason` discriminant.
+    ///
     /// # Errors
     ///
     /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
-    pub fn set_paused(env: Env, paused: bool) -> Result<(), ContractError> {
+    /// - [`ContractError::InvalidPauseReason`] if `reason_code` is unrecognized.
+    pub fn set_paused(env: Env, paused: bool, reason_code: u32) -> Result<(), ContractError> {
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
 
+        if !PauseReason::is_valid(reason_code) {
+            return Err(ContractError::InvalidPauseReason);
+        }
+        let reason = PauseReason::from_code(reason_code).unwrap_or(PauseReason::Other);
+
         set_paused_state(&env, paused);
+        crate::storage::set_pause_reason(&env, reason);
         Ok(())
     }
 
@@ -1458,253 +1496,94 @@ impl TrustBridgeContract {
         is_in_cooldown(&env, &github_username)
     }
 
-    // ── Issue #195: Two-step admin rotation with delay ────────────────────────
+    // ── Reserved username list (Issue #213) ──────────────────────────────────
 
-    /// Proposes a transfer of admin rights to `new_admin`. Admin-only.
+    /// Adds `username` to the admin-managed reserved list. Admin-only.
     ///
-    /// The transfer is not immediate. It becomes executable only after
-    /// `delay_seconds` have elapsed, giving watchers time to detect and
-    /// react to an unexpected proposal. During the delay the current admin
-    /// remains the sole admin — there is no window with two live admins.
-    ///
-    /// Calling this while a proposal is already pending **overwrites** the
-    /// pending record, allowing the current admin to correct a mistaken address
-    /// or delay without having to cancel first.
-    ///
-    /// Emits [`AdminTransferProposedEvent`].
-    ///
-    /// # Errors
-    ///
-    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
-    /// - [`ContractError::Paused`] if the contract is paused.
-    /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
-    /// - [`ContractError::ZeroAddress`] if `new_admin` is the zero/burn address.
-    pub fn propose_admin_transfer(
-        env: Env,
-        new_admin: Address,
-        delay_seconds: u64,
-    ) -> Result<(), ContractError> {
-        require_initialized(&env)?;
-        require_not_paused(&env)?;
-
-        let admin = get_admin(&env)?;
-        admin.require_auth();
-
-        if is_zero_address(&env, &new_admin) {
-            return Err(ContractError::ZeroAddress);
-        }
-
-        let now = env.ledger().timestamp();
-        let executable_at = now.saturating_add(delay_seconds);
-
-        let proposal = AdminTransferProposal {
-            new_admin: new_admin.clone(),
-            proposed_by: admin.clone(),
-            proposed_at: now,
-            executable_at,
-        };
-        set_admin_transfer(&env, &proposal);
-
-        AdminTransferProposedEvent {
-            new_admin,
-            proposed_by: admin,
-            executable_at,
-            timestamp: now,
-        }
-        .publish(&env);
-
-        Ok(())
-    }
-
-    /// Cancels a pending admin transfer proposal. Admin-only.
-    ///
-    /// May be called at any time before `execute_admin_transfer`, including
-    /// during the delay window. No-op if no proposal is pending.
-    ///
-    /// Emits [`AdminTransferCancelledEvent`].
+    /// Once reserved, `register` calls for this username fail with
+    /// [`ContractError::UsernameReserved`] regardless of who signs them.
+    /// The check is case-insensitive, matching GitHub's own identity rules.
     ///
     /// # Errors
     ///
     /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
     /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
-    pub fn cancel_admin_transfer(env: Env) -> Result<(), ContractError> {
+    /// - [`ContractError::InvalidUsername`] if the username is not a valid GitHub username shape.
+    /// - [`ContractError::AlreadyReserved`] if the username is already on the list.
+    /// - [`ContractError::ReservedListFull`] if the list has reached its maximum size.
+    pub fn add_reserved(env: Env, username: String) -> Result<(), ContractError> {
         require_initialized(&env)?;
-
         let admin = get_admin(&env)?;
         admin.require_auth();
 
-        clear_admin_transfer(&env);
-
-        let now = env.ledger().timestamp();
-        AdminTransferCancelledEvent {
-            cancelled_by: admin,
-            timestamp: now,
+        if !crate::utils::is_valid_github_username(&username) {
+            return Err(ContractError::InvalidUsername);
         }
-        .publish(&env);
 
+        crate::storage::add_to_reserved(&env, &username)?;
         Ok(())
     }
 
-    /// Executes a pending admin transfer proposal after the delay has elapsed.
-    ///
-    /// Must be called by the proposed new admin, who proves acceptance by
-    /// signing the transaction. The current admin's rights are revoked at this
-    /// point — there is never a window with two live admins.
-    ///
-    /// After execution:
-    /// - `ADMIN_KEY` points at `new_admin`.
-    /// - The old admin's `Role::Admin` role entry is removed.
-    /// - The new admin is granted `Role::Admin`.
-    ///
-    /// Emits [`AdminTransferExecutedEvent`].
+    /// Removes `username` from the reserved list. Admin-only.
     ///
     /// # Errors
     ///
     /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
-    /// - [`ContractError::Paused`] if the contract is paused.
-    /// - [`ContractError::NoPendingAdminTransfer`] if no proposal exists.
-    /// - [`ContractError::NotAuthorized`] if the caller is not the proposed new admin.
-    /// - [`ContractError::AdminTransferDelayActive`] if the delay has not yet elapsed.
-    pub fn execute_admin_transfer(env: Env, caller: Address) -> Result<(), ContractError> {
+    /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
+    /// - [`ContractError::NotReserved`] if the username is not currently reserved.
+    pub fn remove_reserved(env: Env, username: String) -> Result<(), ContractError> {
         require_initialized(&env)?;
-        require_not_paused(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
 
-        caller.require_auth();
-
-        let proposal =
-            get_admin_transfer(&env).ok_or(ContractError::NoPendingAdminTransfer)?;
-
-        if caller != proposal.new_admin {
-            return Err(ContractError::NotAuthorized);
-        }
-
-        let now = env.ledger().timestamp();
-        if now < proposal.executable_at {
-            return Err(ContractError::AdminTransferDelayActive);
-        }
-
-        let old_admin = proposal.proposed_by.clone();
-
-        // Remove the pending proposal first so state is always consistent.
-        clear_admin_transfer(&env);
-
-        // Atomically rotate: write the new admin key, update roles.
-        env.storage().instance().set(&ADMIN_KEY, &proposal.new_admin);
-        storage_remove_role(&env, &old_admin);
-        storage_set_role(&env, &proposal.new_admin, &Role::Admin);
-
-        AdminTransferExecutedEvent {
-            new_admin: proposal.new_admin.clone(),
-            old_admin,
-            timestamp: now,
-        }
-        .publish(&env);
-
+        crate::storage::remove_from_reserved(&env, &username)?;
         Ok(())
     }
 
-    /// Returns the pending admin transfer proposal, if any.
+    /// Returns `true` if `username` is on the reserved list.
     ///
-    /// Read-only; no auth required. Returns `None` if no transfer is pending.
+    /// Read-only; no auth required. Case-insensitive match.
     #[must_use]
-    pub fn get_admin_transfer(env: Env) -> Option<AdminTransferProposal> {
-        get_admin_transfer(&env)
+    pub fn is_reserved(env: Env, username: String) -> bool {
+        crate::storage::is_reserved(&env, &username)
     }
 
-    // ── Issue #208: Public pending-reverify read ──────────────────────────────
-
-    /// Returns whether `github_username` has a pending re-verification flag.
-    ///
-    /// This flag is set when a verified user re-registers to a different Stellar
-    /// address (the address change invalidates the prior verification, so a new
-    /// off-chain GitHub identity check is required). The flag is cleared once
-    /// the record is successfully `verify`'d.
-    ///
-    /// Read-only; works while the contract is paused. Returns `false` for
-    /// usernames that have never been registered or have been removed.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
-    pub fn get_pending_reverify(
-        env: Env,
-        github_username: String,
-    ) -> Result<bool, ContractError> {
-        require_initialized(&env)?;
-        // Deliberately allowed while paused — read-only path.
-        Ok(storage_get_pending_reverify(&env, &github_username))
-    }
-
-    /// Returns a page of usernames that have a pending re-verification flag.
-    ///
-    /// Iterates over the global username index from `offset`, collecting at
-    /// most `limit` usernames whose pending-reverify flag is set. Useful for
-    /// dashboard sync jobs that need to identify all contributors requiring a
-    /// new GitHub identity check after an address change.
-    ///
-    /// Read-only; works while the contract is paused.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
-    pub fn get_pending_reverify_page(
-        env: Env,
-        offset: u32,
-        limit: u32,
-    ) -> Result<Vec<String>, ContractError> {
-        require_initialized(&env)?;
-        // Read-only — allowed while paused.
-
-        let capped_limit = limit.min(crate::storage::MAX_PAGE_LIMIT);
-        let index = crate::storage::get_index_page(&env, offset, capped_limit * 10); // over-fetch to find `limit` flagged
-        let mut result = Vec::new(&env);
-
-        for i in 0..index.len() {
-            if result.len() >= capped_limit {
-                break;
-            }
-            if let Some(username) = index.get(i) {
-                if storage_get_pending_reverify(&env, &username) {
-                    result.push_back(username);
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    // ── Issue #198: Attestation-required mode ─────────────────────────────────
-
-    /// Configures whether WASM attestation is required before an upgrade. Admin-only.
-    ///
-    /// When `required` is `true`, `upgrade` will fail with
-    /// [`ContractError::AttestationRequired`] if no valid, matching attestation
-    /// is present. This enforces the two-step upgrade flow on-chain for
-    /// deployments that require it.
-    ///
-    /// When `required` is `false` (the default), the existing opt-in behavior
-    /// is preserved: an upgrade without a published attestation succeeds, and
-    /// the provenance record notes that it was unattested.
+    /// Returns the full reserved username list. Admin-only.
     ///
     /// # Errors
     ///
     /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
     /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
-    pub fn set_attestation_required(env: Env, required: bool) -> Result<(), ContractError> {
+    pub fn get_reserved_list(env: Env) -> Result<Vec<String>, ContractError> {
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
-        set_attestation_required(&env, required);
-        Ok(())
+        Ok(crate::storage::get_reserved_list(&env))
     }
 
-    /// Returns whether WASM attestation is required before an upgrade.
+    // ── Index compaction (Issue #209) ─────────────────────────────────────────
+
+    /// Rebuilds the chunked username index densely. Admin-only.
     ///
-    /// Read-only; no auth required. Defaults to `false` on instances that have
-    /// never called `set_attestation_required`.
-    #[must_use]
-    pub fn is_attestation_required(env: Env) -> bool {
-        is_attestation_required(&env)
+    /// After removals, chunks may have empty slots (holes). This operation
+    /// re-partitions the current flat index into contiguous full chunks plus
+    /// a single partial tail, removing all holes and reclaiming persistent
+    /// storage entries that are now empty. Pagination results remain the same
+    /// except that empty gaps are eliminated.
+    ///
+    /// Returns the number of chunks written after compaction.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if the caller is not the contract admin.
+    pub fn compact_index(env: Env) -> Result<u32, ContractError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        let chunks_written = crate::storage::compact_chunked_index(&env);
+        Ok(chunks_written)
     }
 }
 
@@ -2089,7 +1968,7 @@ mod test {
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
@@ -3028,7 +2907,7 @@ mod test {
         let contract_id = env.register(TrustBridgeContract, ());
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            let result = TrustBridgeContract::pause(env.clone());
+            let result = TrustBridgeContract::pause(env.clone(), 1);
             assert_eq!(result, Err(ContractError::NotInitialized));
         });
     }
@@ -3039,7 +2918,7 @@ mod test {
         let contract_id = env.register(TrustBridgeContract, ());
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            let result = TrustBridgeContract::unpause(env.clone());
+            let result = TrustBridgeContract::unpause(env.clone(), 4);
             assert_eq!(result, Err(ContractError::NotInitialized));
         });
     }
@@ -3131,16 +3010,18 @@ mod test {
             ContractError::InvalidBatchSize,
             ContractError::InvalidReasonCode,
             ContractError::ZeroAddress,
-            ContractError::AdminTransferPending,
-            ContractError::AdminTransferDelayActive,
-            ContractError::NoPendingAdminTransfer,
-            ContractError::AttestationRequired,
+            ContractError::InvalidPauseReason,
+            ContractError::AlreadyReserved,
+            ContractError::NotReserved,
+            ContractError::UsernameReserved,
+            ContractError::ReservedListFull,
         ] {
             assert_eq!(ContractError::from_code(variant.code()), Some(variant));
         }
         assert_eq!(ContractError::from_code(0), None);
-        // 21 is one past the highest assigned variant (AttestationRequired = 20):
-        assert_eq!(ContractError::from_code(21), None);
+        // 22 is one past the highest assigned variant (ReservedListFull = 21):
+        // the first code guaranteed not to collide with a real variant.
+        assert_eq!(ContractError::from_code(22), None);
     }
 
     // --- Issue #69: max username length guard ---
@@ -3494,7 +3375,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
 
         env.as_contract(&contract_id, || {
@@ -3510,7 +3391,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::unpause(env.clone()).unwrap();
+            TrustBridgeContract::unpause(env.clone(), 4).unwrap();
         });
 
         env.as_contract(&contract_id, || {
@@ -3541,7 +3422,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
 
         env.mock_all_auths();
@@ -3557,7 +3438,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::unpause(env.clone()).unwrap();
+            TrustBridgeContract::unpause(env.clone(), 4).unwrap();
         });
 
         env.mock_all_auths();
@@ -3749,7 +3630,8 @@ mod test {
     #[test]
     fn test_from_code_unknown_returns_none() {
         assert_eq!(ContractError::from_code(0), None);
-        assert_eq!(ContractError::from_code(21), None);
+        // 22 is one past ReservedListFull = 21, the highest known code.
+        assert_eq!(ContractError::from_code(22), None);
         assert_eq!(ContractError::from_code(u32::MAX), None);
     }
 
@@ -4660,7 +4542,7 @@ mod test {
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
@@ -4894,7 +4776,7 @@ mod test {
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
@@ -5069,7 +4951,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
         });
 
         env.mock_all_auths();
@@ -5582,7 +5464,7 @@ mod test {
 
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::pause(env.clone()).unwrap();
+            TrustBridgeContract::pause(env.clone(), 1).unwrap();
             let usernames = soroban_sdk::vec![&env, username(&env, "user1")];
             assert_eq!(
                 TrustBridgeContract::batch_verify(env.clone(), admin.clone(), usernames),
