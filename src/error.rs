@@ -75,6 +75,25 @@ pub enum ContractError {
     /// Operation is blocked because a challenge is active on this username
     /// (Issue #214).
     ChallengeActive = 20,
+    /// `pause` / `unpause` / `set_paused` were called with an unrecognized reason code.
+    InvalidPauseReason = 21,
+    /// `add_reserved` was called with a username that is already reserved.
+    AlreadyReserved = 22,
+    /// `remove_reserved` was called with a username that is not reserved.
+    NotReserved = 23,
+    /// `register` was called with a username on the reserved list.
+    UsernameReserved = 24,
+    /// The reserved list has reached its maximum allowed size.
+    ReservedListFull = 25,
+    /// `propose_admin_transfer` was called while a transfer is already pending,
+    /// or `execute_admin_transfer` was called with no pending transfer.
+    AdminTransferPending = 26,
+    /// `execute_admin_transfer` was called before the delay has elapsed.
+    AdminTransferDelayActive = 27,
+    /// `execute_admin_transfer` was called with no pending transfer proposal.
+    NoPendingAdminTransfer = 28,
+    /// `upgrade` was called without a required attestation (attestation-required mode is on).
+    AttestationRequired = 29,
 }
 
 impl ContractError {
@@ -110,6 +129,15 @@ impl ContractError {
             18 => Some(ContractError::NoChallengeActive),
             19 => Some(ContractError::ChallengeNotResolvable),
             20 => Some(ContractError::ChallengeActive),
+            21 => Some(ContractError::InvalidPauseReason),
+            22 => Some(ContractError::AlreadyReserved),
+            23 => Some(ContractError::NotReserved),
+            24 => Some(ContractError::UsernameReserved),
+            25 => Some(ContractError::ReservedListFull),
+            26 => Some(ContractError::AdminTransferPending),
+            27 => Some(ContractError::AdminTransferDelayActive),
+            28 => Some(ContractError::NoPendingAdminTransfer),
+            29 => Some(ContractError::AttestationRequired),
             _ => None,
         }
     }

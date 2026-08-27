@@ -15,6 +15,7 @@ struct ContributorRecord {
     stellar_address: Address,
     registered_at: u32,  // u32 saves 4 bytes vs u64; sufficient until ~2106
     verified: bool,
+    is_bot: bool,
 }
 ```
 
@@ -276,6 +277,24 @@ stellar contract invoke --id $CONTRACT_ID \
 | `InvalidUsername` (code 11) | Username empty, >39 chars, or contains disallowed characters | Use 1–39 ASCII alphanumerics, hyphens, underscores |
 | `NotAuthorized` (code 3) | `stellar_address` did not sign, or old address did not sign on transfer | Ensure the correct source account is used |
 
+
+---
+
+### `register_sponsored(github_username: String, stellar_address: Address, sponsor: Address) -> Result<(), ContractError>`
+
+Register or update a GitHub username mapping sponsored by a maintainer/account.
+
+| | |
+|---|---|
+| **Auth** | Both `stellar_address` and `sponsor` must sign; if already registered to a different address, that old address must sign too (double-auth protection) |
+| **Mutates** | Yes |
+| **Errors** | `NotInitialized`, `Paused`, `InvalidUsername` |
+| **Events** | `RegisteredEvent` (carrying the sponsor) |
+
+```bash
+stellar contract invoke --id $ID --source sponsor_key --network testnet --send=yes \
+  -- register_sponsored --github-username octocat --stellar-address G... --sponsor G...
+```
 
 ---
 
@@ -746,6 +765,28 @@ after the record has already been through one full cycle. Covered by
 
 ---
 
+### `set_bot_status(caller: Address, github_username: String, is_bot: bool) -> Result<(), ContractError>`
+
+Sets the bot-account status flag on a contributor record.
+
+| | |
+|---|---|
+| **Auth** | `caller` must sign; must be admin or registrant |
+| **Mutates** | Yes |
+| **Errors** | `NotInitialized`, `NotRegistered`, `NotAuthorized` |
+
+```bash
+# Registrant setting own bot flag
+stellar contract invoke --id $ID --source registrant --network testnet --send=yes \
+  -- set_bot_status --caller G... --github-username octocat --is_bot true
+
+# Admin setting bot flag
+stellar contract invoke --id $ID --source admin --network testnet --send=yes \
+  -- set_bot_status --caller G... --github-username octocat --is_bot true
+```
+
+---
+
 ### `get_verified_count() -> u32`
 
 Returns the number of verified registrations.
@@ -959,7 +1000,7 @@ duplicate deliveries of `RegisteredEvent` / `VerifiedEvent` /
 
 ```
 topics: ["registered_event", github_username]
-data:   { stellar_address, timestamp }
+data:   { stellar_address, timestamp, sponsor: Option<Address> }
 ```
 
 ### RemovedEvent

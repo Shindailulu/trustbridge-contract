@@ -181,6 +181,7 @@ pub struct ContributorRecord {
     pub registered_at: u32,
     /// Whether the contributor has been verified by an admin or Verifier.
     pub verified: bool,
+    pub is_bot: bool,
 }
 
 /// Provenance of the currently deployed WASM executable (Wave #24).

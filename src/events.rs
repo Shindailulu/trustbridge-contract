@@ -8,6 +8,7 @@ pub struct RegisteredEvent {
     pub github_username: String,
     pub stellar_address: Address,
     pub timestamp: u64,
+    pub sponsor: Option<Address>,
 }
 
 /// Emitted when a registration is removed by the registrant or admin.
